@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/license-Open%20Source-blue)
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi-red)
-![Version](https://img.shields.io/badge/version-0.4.2-green)
+![Version](https://img.shields.io/badge/version-0.4.3-green)
 ![Status](https://img.shields.io/badge/status-Production%20Ready-brightgreen)
 
 **Professional-grade physical access control powered by Raspberry Pi**
@@ -706,7 +706,7 @@ Contributions welcome! Please:
 
 ## Roadmap
 
-**Current Version: 0.4.2** - Pre-release
+**Current Version: 0.4.3** - Pre-release
 
 **Future Enhancements** (community contributions welcome):
 - Mobile app (iOS/Android)
@@ -720,6 +720,13 @@ Contributions welcome! Please:
 ## Changelog
 
 > **Note:** Version numbering was reset from 3.x to 0.x in April 2026. The project had rapidly iterated from v1.0 to v3.2 during initial development. The 0.x series reflects pre-release status as the system matures toward a proper v1.0.0 release.
+
+### Version 0.4.3 (August 2026)
+**Dependency security updates** — clears every open advisory in the React SPA toolchain (`npm audit`: 0 vulnerabilities). No application code changed; the pre-built SPA bundle was rebuilt against the patched dependencies.
+- `postcss` 8.5.15 → 8.5.26 — fixes a path traversal in source-map auto-loading, where a crafted `sourceMappingURL` comment could disclose arbitrary `.map` files ([GHSA-r28c-9q8g-f849](https://github.com/advisories/GHSA-r28c-9q8g-f849)).
+- `react-router` / `react-router-dom` 6.30.4 → 7.18.2 — the open redirect leading to XSS ([GHSA-jjmj-jmhj-qwj2](https://github.com/advisories/GHSA-jjmj-jmhj-qwj2)) has no patch on the 6.x line, so this required the 6 → 7 major upgrade. That also picks up arbitrary constructor injection via `deserializeErrors()` in SSR hydration ([GHSA-337j-9hxr-rhxg](https://github.com/advisories/GHSA-337j-9hxr-rhxg)) and an open redirect via backslash in `<Link>` / `useNavigate` ([GHSA-wrjc-x8rr-h8h6](https://github.com/advisories/GHSA-wrjc-x8rr-h8h6)).
+
+The router major needed no source changes: the UI uses only `BrowserRouter`, `Routes`, `Route`, `Navigate`, `Outlet`, `Link`, `NavLink`, `useSearchParams` and `useNavigate` — all unchanged in v7 — and has no data-router loaders/actions, `<Form>`, or splat-relative links.
 
 ### Version 0.4.2 (June 2026)
 **Installer fix.** A fresh `sudo ./install.sh` failed on every run under the `set -euo pipefail` hardening added in v0.4.0: the `prompt` / `prompt_secret` helpers referenced uninitialized variables — `local value` (tested by `while [ -z "$value" ]`) and an optional positional `default="$3"` — which `set -u` (nounset) treats as a fatal "unbound variable" error, aborting the install at the first password/email prompt. Initialized both (`local value=""`, `default="${3:-}"`) so the installer completes. No application code or dependency changes; the secured v0.4.1 SPA bundle is unchanged.
