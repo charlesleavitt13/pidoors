@@ -20,6 +20,7 @@ Features:
 from datetime import datetime, timedelta
 import sys
 import os
+import ssl
 
 # Ensure install dir is in sys.path for local imports (formats, readers)
 # even when WorkingDirectory is set to a runtime dir for lgpio temp files
@@ -156,11 +157,11 @@ def _try_db_connect(kwargs):
     credentials over the wire.
     """
     kw = dict(kwargs)
-    # ssl_verify_cert / ssl_verify_identity require pymysql >= 1.0; harmless on
-    # older versions where the 'ssl' dict alone enables verification.
-    kw['ssl'] = {'ca': SSL_CA_PATH}
-    kw['ssl_verify_cert'] = True
-    kw['ssl_verify_identity'] = True
+    ssl_context = ssl.create_default_context(cafile=SSL_CA_PATH)
+    strict_flag = getattr(ssl, 'VERIFY_X509_STRICT', 0)
+    if strict_flag:
+        ssl_context.verify_flags &= ~strict_flag
+    kw['ssl'] = ssl_context
     return pymysql.connect(**kw)
 
 

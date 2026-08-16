@@ -224,21 +224,39 @@ if [ "$INSTALL_SERVER" = true ]; then
         else
             info "Generating MariaDB TLS certificates..."
 
-            # Generate CA key and cert
+            # Generate CA key and cert with proper X509v3 extensions for strict SSL verification
             openssl genrsa 2048 > "$CERT_DIR/ca-key.pem" 2>/dev/null
+            # Create CA extensions config
+            cat > "$CERT_DIR/ca-ext.cnf" <<'CAEXTEXT'
+[req]
+distinguished_name = req_distinguished_name
+[req_distinguished_name]
+[v3_ca]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical, CA:true
+keyUsage = critical, keyCertSign, cRLSign
+CAEXTEXT
             openssl req -new -x509 -nodes -days 3650 \
                 -key "$CERT_DIR/ca-key.pem" \
                 -out "$CERT_DIR/ca.pem" \
-                -subj "/CN=PiDoors CA" 2>/dev/null
+                -subj "/CN=PiDoors CA" \
+                -extensions v3_ca \
+                -config "$CERT_DIR/ca-ext.cnf" 2>/dev/null
+            rm -f "$CERT_DIR/ca-ext.cnf"
 
-            # Generate server key and cert signed by CA (with SAN for IP verification)
+            # Generate server key and cert signed by CA (with SAN and keyUsage for IP verification)
             local SERVER_IP
             SERVER_IP=$(hostname -I | awk '{print $1}')
             openssl genrsa 2048 > "$CERT_DIR/server-key.pem" 2>/dev/null
             openssl req -new -key "$CERT_DIR/server-key.pem" \
                 -out "$CERT_DIR/server-req.pem" \
                 -subj "/CN=PiDoors DB Server" 2>/dev/null
-            echo "subjectAltName = IP:${SERVER_IP},IP:127.0.0.1,DNS:localhost" > "$CERT_DIR/server-ext.cnf"
+            cat > "$CERT_DIR/server-ext.cnf" <<SERVEREXTEXT
+subjectAltName = IP:${SERVER_IP},IP:127.0.0.1,DNS:localhost
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+SERVEREXTEXT
             openssl x509 -req -days 3650 \
                 -in "$CERT_DIR/server-req.pem" \
                 -CA "$CERT_DIR/ca.pem" \
@@ -262,10 +280,13 @@ if [ "$INSTALL_SERVER" = true ]; then
         chmod 640 "$CERT_DIR"/ca-key.pem 2>/dev/null || true
         chmod 644 "$CERT_DIR/ca.pem" "$CERT_DIR/server-cert.pem" 2>/dev/null || true
 
-        # Add TLS config to MariaDB if not already present
-        # Match only uncommented ssl-ca lines (default config has #ssl-ca which is not active)
-        if [ -f "$MARIADB_CNF" ] && ! grep -q "^ssl-ca" "$MARIADB_CNF"; then
+        # Add TLS config to MariaDB if not already present. PiDoors uses
+        # one-way TLS, so do not configure ssl-ca here: MariaDB may send that
+        # self-signed CA as part of the server chain, which strict Python TLS
+        # clients reject even when the CA is trusted locally.
+        if [ -f "$MARIADB_CNF" ]; then
             info "Configuring MariaDB TLS..."
+            sed -i '/^[[:space:]]*ssl-ca[[:space:]]*=/d' "$MARIADB_CNF"
             # Find the server section header ([mysqld] on older, [mariadbd] on newer MariaDB)
             local SECTION_HEADER
             if grep -q '^\[mysqld\]' "$MARIADB_CNF"; then
@@ -278,7 +299,10 @@ if [ "$INSTALL_SERVER" = true ]; then
                 SECTION_HEADER=""
             fi
             if [ -n "$SECTION_HEADER" ]; then
-                sed -i "/${SECTION_HEADER}/a ssl-ca = /etc/mysql/ssl/ca.pem\nssl-cert = /etc/mysql/ssl/server-cert.pem\nssl-key = /etc/mysql/ssl/server-key.pem" "$MARIADB_CNF"
+                sed -i '/^[[:space:]]*ssl-cert[[:space:]]*=/d; /^[[:space:]]*ssl-key[[:space:]]*=/d' "$MARIADB_CNF"
+                sed -i "/${SECTION_HEADER}/a\\
+ssl-cert = /etc/mysql/ssl/server-cert.pem\\
+ssl-key = /etc/mysql/ssl/server-key.pem" "$MARIADB_CNF"
                 systemctl restart mariadb
                 ok "MariaDB TLS enabled"
             else
@@ -318,9 +342,11 @@ if [ "$INSTALL_SERVER" = true ]; then
             -out /tmp/pidoors-nginx.csr \
             -subj "/CN=PiDoors Web" 2>/dev/null
 
-        # SAN extension file
+        # SAN and keyUsage extension file for web server
         cat > /tmp/pidoors-nginx-ext.cnf <<SANEOF
 subjectAltName = IP:${SERVER_IP},DNS:pidoors,DNS:pidoors.local,DNS:localhost,IP:127.0.0.1
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
 SANEOF
 
         # Sign with CA
@@ -365,6 +391,9 @@ SANEOF
     echo "  ${YELLOW}Save this password - you will need it when setting up door controllers.${NC}"
     echo
     prompt_secret DB_PASS "New PiDoors database password"
+
+    # Generate enrollment token for controller certificate signing
+    ENROLLMENT_TOKEN=$(openssl rand -hex 32)
 
     info "Creating databases and user..."
 
@@ -532,6 +561,8 @@ EOF
         sed -i "s/'sqlpass' => ''/'sqlpass' => '$ESCAPED_DB_PASS'/g" "$WEB_ROOT/includes/config.php"
         SERVER_IP=$(hostname -I | awk '{print $1}')
         sed -i "s|'url' => 'http://localhost'|'url' => 'https://$SERVER_IP'|g" "$WEB_ROOT/includes/config.php"
+        sed -i "s/'enrollment_token' => ''/'enrollment_token' => '$ENROLLMENT_TOKEN'/g" "$WEB_ROOT/includes/config.php"
+        sed -i "s|'sql_ssl_ca' => ''|'sql_ssl_ca' => '/etc/mysql/ssl/ca.pem'|g" "$WEB_ROOT/includes/config.php"
         chmod 640 "$WEB_ROOT/includes/config.php"
         chown www-data:www-data "$WEB_ROOT/includes/config.php"
         ok "Config file created"
@@ -852,6 +883,24 @@ if [ "$INSTALL_DOOR" = true ]; then
     fi
     ok "Controller files copied"
 
+    # ── Enrollment token ──
+    # Prompt for enrollment_token for certificate signing.
+    # If this is a same-machine server+door install, use the token generated during server setup.
+    # If this is a standalone door install, user must provide the token from the server's config.php.
+    step "Door Controller: Enrollment token"
+
+    if [ -z "${ENROLLMENT_TOKEN:-}" ]; then
+        echo "  The enrollment token is required for the server to sign the controller's TLS certificate."
+        echo "  This token is configured on the server in: /var/www/pidoors/includes/config.php"
+        echo
+        echo "  If you installed the server on this machine, the token was auto-generated."
+        echo "  If the server is on a different machine, copy the token from the server's config.php file."
+        echo
+        prompt_secret ENROLLMENT_TOKEN "Enrollment token"
+    else
+        ok "Using enrollment token from server install (same machine)"
+    fi
+
     # Generate API key for push communication
     API_KEY=$(openssl rand -hex 32)
     LISTEN_PORT=8443
@@ -874,7 +923,7 @@ if [ "$INSTALL_DOOR" = true ]; then
     CURL_EXIT=0
     SIGN_RESPONSE=$(curl -s -k --max-time 10 "https://$DB_HOST/api/certs/sign" \
         -H 'Content-Type: application/json' \
-        -d "{\"db_user\":\"$DB_USER\",\"db_pass\":\"$(echo "$DB_PASS_DOOR" | sed 's/"/\\"/g')\",\"csr\":$(echo "$CSR_PEM" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"door_name\":\"$DOOR_NAME\",\"door_ip\":\"$CONTROLLER_IP\"}" \
+        -d "{\"db_user\":\"$DB_USER\",\"db_pass\":\"$(echo "$DB_PASS_DOOR" | sed 's/"/\\"/g')\",\"csr\":$(echo "$CSR_PEM" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"door_name\":\"$DOOR_NAME\",\"door_ip\":\"$CONTROLLER_IP\",\"enrollment_token\":\"$ENROLLMENT_TOKEN\"}" \
         2>&1) || CURL_EXIT=$?
 
     if [ $CURL_EXIT -ne 0 ]; then
@@ -910,6 +959,7 @@ if [ "$INSTALL_DOOR" = true ]; then
         "sqluser": "$DB_USER",
         "sqlpass": "$DB_PASS_DOOR",
         "sqldb": "$DB_NAME",
+        "sql_ssl_ca": "$INSTALL_DIR/conf/ca.pem",
         "api_key": "$API_KEY",
         "listen_port": $LISTEN_PORT
     }
@@ -1198,6 +1248,11 @@ if [ "$INSTALL_SERVER" = true ]; then
     echo -e "    Web root:   $WEB_ROOT"
     echo -e "    Nginx:      /etc/nginx/sites-available/pidoors"
     echo -e "    Backup:     /usr/local/bin/pidoors-backup.sh"
+    echo
+    echo -e "  ${BOLD}Controller Enrollment${NC}"
+    echo -e "    Token:      ${GREEN}${ENROLLMENT_TOKEN}${NC}"
+    echo -e "    Location:   $WEB_ROOT/includes/config.php"
+    echo -e "    ${YELLOW}For remote door controllers, copy this token and provide during install${NC}"
     echo
 fi
 
