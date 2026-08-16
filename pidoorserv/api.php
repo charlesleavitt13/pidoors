@@ -1269,7 +1269,29 @@ if ($resource === 'cards') {
 
         $fields = [];
         $params = [];
-        $string_fields = ['user_id', 'facility', 'firstname', 'lastname', 'doors', 'email', 'phone', 'department', 'employee_id', 'company', 'title', 'notes'];
+        $new_card_id = array_key_exists('card_id', $input) ? trim((string)$input['card_id']) : null;
+        $new_user_id = array_key_exists('user_id', $input) ? trim((string)$input['user_id']) : null;
+        $new_facility = array_key_exists('facility', $input) ? sanitize_string($input['facility']) : null;
+
+        if ($new_card_id !== null || $new_user_id !== null || $new_facility !== null) {
+            $current_stmt = $pdo_access->prepare("SELECT id, card_id, user_id, facility FROM cards WHERE card_id = ?");
+            $current_stmt->execute([$id]);
+            $current_card = $current_stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$current_card) json_error('Card not found', 404);
+
+            $effective_card_id = $new_card_id !== null ? $new_card_id : $current_card['card_id'];
+            $effective_user_id = $new_user_id !== null ? $new_user_id : $current_card['user_id'];
+            $effective_facility = $new_facility !== null ? $new_facility : $current_card['facility'];
+            if ($effective_card_id === '' || $effective_user_id === '') {
+                json_error('Card ID and User ID are required');
+            }
+
+            $duplicate = $pdo_access->prepare("SELECT id FROM cards WHERE id <> ? AND (user_id = ? OR (card_id = ? AND facility = ?))");
+            $duplicate->execute([$current_card['id'] ?? 0, $effective_user_id, $effective_card_id, $effective_facility]);
+            if ($duplicate->fetch()) json_error('A card with this Card ID/facility or User ID already exists');
+        }
+
+        $string_fields = ['card_id', 'user_id', 'facility', 'firstname', 'lastname', 'doors', 'email', 'phone', 'department', 'employee_id', 'company', 'title', 'notes'];
         foreach ($string_fields as $f) {
             if (isset($input[$f])) {
                 $fields[] = "$f = ?";
@@ -1290,24 +1312,30 @@ if ($resource === 'cards') {
             $pdo_access->prepare("UPDATE cards SET " . implode(', ', $fields) . " WHERE card_id = ?")->execute($params);
         }
 
+        $master_card_id = $new_card_id !== null && $new_card_id !== '' ? $new_card_id : $id;
+        if ($new_card_id !== null && $new_card_id !== '' && $new_card_id !== $id) {
+            $pdo_access->prepare("UPDATE master_cards SET card_id = ? WHERE card_id = ?")
+                ->execute([$new_card_id, $id]);
+        }
+
         // Sync master_card status
         if (isset($input['master_card'])) {
             try {
                 $mc_stmt = $pdo_access->prepare("SELECT id FROM master_cards WHERE card_id = ? AND active = 1");
-                $mc_stmt->execute([$id]);
+                $mc_stmt->execute([$master_card_id]);
                 $is_master = (bool)$mc_stmt->fetch();
 
                 if ($input['master_card'] && !$is_master) {
                     // Get card details for master_cards entry
                     $card_detail = $pdo_access->prepare("SELECT user_id, facility, firstname, lastname FROM cards WHERE card_id = ?");
-                    $card_detail->execute([$id]);
+                    $card_detail->execute([$master_card_id]);
                     $cd = $card_detail->fetch(PDO::FETCH_ASSOC);
                     if ($cd) {
                         $pdo_access->prepare("INSERT INTO master_cards (card_id, user_id, facility, description, active) VALUES (?, ?, ?, ?, 1)")
-                            ->execute([$id, $cd['user_id'], $cd['facility'], $cd['firstname'] . ' ' . $cd['lastname']]);
+                            ->execute([$master_card_id, $cd['user_id'], $cd['facility'], $cd['firstname'] . ' ' . $cd['lastname']]);
                     }
                 } elseif (!$input['master_card'] && $is_master) {
-                    $pdo_access->prepare("DELETE FROM master_cards WHERE card_id = ?")->execute([$id]);
+                    $pdo_access->prepare("DELETE FROM master_cards WHERE card_id = ?")->execute([$master_card_id]);
                 }
             } catch (PDOException $e) { /* master_cards table may not exist */ }
         }

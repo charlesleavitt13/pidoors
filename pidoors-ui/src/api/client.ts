@@ -3,7 +3,19 @@ let csrfToken: string | null = null;
 async function fetchCsrfToken(): Promise<string> {
   const res = await fetch('/api/auth/csrf');
   if (!res.ok) throw new Error('Failed to fetch CSRF token');
-  const data = await res.json();
+  const responseText = await res.text();
+  let data: { token?: string; msg?: string; error?: string };
+  try {
+    data = JSON.parse(responseText) as { token?: string; msg?: string; error?: string };
+  } catch {
+    throw new ApiError(
+      responseText.trim() || 'The server returned an empty response',
+      res.status
+    );
+  }
+  if (typeof data.token !== 'string' || !data.token) {
+    throw new Error('CSRF response did not contain a token');
+  }
   csrfToken = data.token;
   return csrfToken!;
 }
