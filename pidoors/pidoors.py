@@ -1620,23 +1620,18 @@ def _capture_keypad_diagnostic(reader, bitstring):
     )
 
 
-def _log_pin_access(user_id, granted, reason):
-    """Log a PIN access attempt without recording the entered PIN."""
-    log_access(user_id, "PIN", "", granted, reason)
-
-
 def _submit_keypad_pin(reader, pin):
-    """Authorize a completed keypad PIN online without logging its value."""
+    """Authorize a completed keypad PIN online."""
     global db_connected, last_db_attempt
 
     if door_is_locked_down():
-        reject_card("PIN", "Door is in lockdown")
-        _log_pin_access("PIN", False, "Lockdown mode active")
+        reject_card(pin, "Door is in lockdown")
+        log_access(None, pin, "", False, "Lockdown mode active")
         return
 
     if not MYSQL_AVAILABLE:
-        reject_card("PIN", "PIN access unavailable")
-        _log_pin_access("PIN", False, "PIN access unavailable")
+        reject_card(pin, "PIN access unavailable")
+        log_access(None, pin, "", False, "PIN access unavailable")
         return
 
     now = datetime.now()
@@ -1660,13 +1655,13 @@ def _submit_keypad_pin(reader, pin):
         cursor.execute("SELECT * FROM cards WHERE card_id = %s LIMIT 2", (pin,))
         cards = cursor.fetchall()
         if len(cards) != 1:
-            reject_card("PIN", "Invalid PIN")
+            reject_card(pin, "Invalid PIN")
             cursor.execute("""
                 INSERT INTO logs (user_id, Date, Granted, Location, doorip)
                 VALUES (%s, %s, 0, %s, %s)
-            """, ("PIN", now, zone, myip))
+            """, (pin, now, zone, myip))
             db.commit()
-            _log_pin_access("PIN", False, "Invalid PIN")
+            log_access(None, pin, "", False, "Invalid PIN")
             return
 
         card = cards[0]
@@ -1715,13 +1710,13 @@ def _submit_keypad_pin(reader, pin):
             VALUES (%s, %s, %s, %s, %s)
         """, (user_id, now, 1 if granted else 0, zone, myip))
         db.commit()
-        _log_pin_access(user_id, granted, reason)
+        log_access(user_id, pin, "", granted, reason)
     except Exception as e:
         with state_lock:
             db_connected = False
         debug(f"PIN access check failed: {e}")
-        reject_card("PIN", "PIN access unavailable")
-        _log_pin_access("PIN", False, "PIN access unavailable")
+        reject_card(pin, "PIN access unavailable")
+        log_access(None, pin, "", False, "PIN access unavailable")
     finally:
         if db:
             try:
@@ -1731,7 +1726,7 @@ def _submit_keypad_pin(reader, pin):
 
 
 def _handle_keypad_frame(reader, bitstring):
-    """Handle the T-AC04's four-bit per-key Wiegand keypad output."""
+    """Handle four-bit per-key Wiegand keypad output."""
     if not reader.get("keypad_enabled") or len(bitstring) != 4:
         return False
 
@@ -1754,8 +1749,8 @@ def _handle_keypad_frame(reader, bitstring):
         else:
             reader["keypad_pin"] = ""
             reader["keypad_pin_updated_at"] = now
-            reject_card("PIN", "PIN entry too long")
-            _log_pin_access("PIN", False, "PIN entry too long")
+            reject_card(reader["keypad_pin"], "PIN entry too long")
+            log_access(None, reader["keypad_pin"], "", False, "PIN entry too long")
         return True
 
     if key_code == 10:  # * is reserved by other keypad modes.
@@ -1768,8 +1763,8 @@ def _handle_keypad_frame(reader, bitstring):
         if pin:
             _submit_keypad_pin(reader, pin)
         else:
-            reject_card("PIN", "Invalid PIN")
-            _log_pin_access("PIN", False, "Invalid PIN")
+            reject_card(pin, "Invalid PIN")
+            log_access(None, pin, "", False, "Invalid PIN")
         return True
 
     return False

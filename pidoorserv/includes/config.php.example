@@ -43,6 +43,7 @@ return [
     'max_failed_attempts' => 5,
     'lockout_duration' => 300, // 5 minutes in seconds
 
-    // Timezone
+    // Timezone fallback used only before the DB 'settings' row exists or if that lookup fails.
+    // The authoritative timezone is the Settings page (DB settings.timezone).
     'timezone' => 'America/New_York'
 ];

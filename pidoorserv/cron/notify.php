@@ -4,7 +4,7 @@
  * PiDoors Access Control System
  *
  * Runs every 5 minutes via cron to detect events and send notifications.
- * Usage: */5 * * * * www-data php /var/www/pidoors/cron/notify.php
+ * Usage: * /5 * * * * www-data php /var/www/pidoors/cron/notify.php
  */
 
 // CLI only - reject web access
@@ -17,8 +17,6 @@ if (php_sapi_name() !== 'cli') {
 $config = include(__DIR__ . '/../includes/config.php');
 require_once __DIR__ . '/../includes/smtp.php';
 require_once __DIR__ . '/../includes/notifications.php';
-
-date_default_timezone_set($config['timezone'] ?? 'UTC');
 
 try {
     $pdo_options = [
@@ -42,6 +40,16 @@ try {
     error_log("PiDoors notify cron: DB connection failed: " . $e->getMessage());
     exit(1);
 }
+
+// Settings-page timezone (DB) is authoritative; config.php is only a pre-migration fallback.
+$site_timezone = $config['timezone'] ?? 'UTC';
+try {
+    $tz_row = $pdo_access->query("SELECT setting_value FROM settings WHERE setting_key = 'timezone'")->fetch();
+    if ($tz_row && !empty($tz_row['setting_value'])) {
+        $site_timezone = $tz_row['setting_value'];
+    }
+} catch (Exception $e) {}
+date_default_timezone_set($site_timezone);
 
 // Load notification settings - bail early if disabled
 $ns = get_notification_settings($pdo_access);

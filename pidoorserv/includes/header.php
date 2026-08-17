@@ -9,9 +9,6 @@ $config = include(__DIR__ . '/config.php');
 require_once __DIR__ . '/security.php';
 require_once $config['apppath'] . 'database/db_connection.php';
 
-// Set timezone
-date_default_timezone_set($config['timezone']);
-
 // Start secure session
 secure_session_start($config);
 

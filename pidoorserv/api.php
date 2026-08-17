@@ -97,22 +97,12 @@ try {
     error_log("Auto-migration check error: " . $e->getMessage());
 }
 
-// Load configured timezone for timestamp conversion
-$app_timezone = null;
-try {
-    $tz_row = $pdo_access->query("SELECT setting_value FROM settings WHERE setting_key = 'timezone'")->fetch();
-    if ($tz_row && !empty($tz_row['setting_value'])) {
-        $app_timezone = new DateTimeZone($tz_row['setting_value']);
-    }
-} catch (Exception $e) {}
-
-// Convert a DB datetime string to the app's configured timezone
+// Log timestamps are already stored in the site's local timezone (db_connection.php sets
+// PHP's default tz to match), so no zone conversion is needed here — just normalize the format.
 function convert_tz(string $datetime): string {
-    global $app_timezone;
-    if (!$app_timezone || empty($datetime)) return $datetime;
+    if (empty($datetime)) return $datetime;
     try {
-        $dt = new DateTime($datetime, new DateTimeZone(date_default_timezone_get()));
-        $dt->setTimezone($app_timezone);
+        $dt = new DateTime($datetime);
         return $dt->format('Y-m-d H:i:s');
     } catch (Exception $e) {
         return $datetime;
