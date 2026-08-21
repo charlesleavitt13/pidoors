@@ -43,6 +43,7 @@ function DoorFormModal({
     description: '',
     ip_address: '',
     schedule_id: null,
+    hold_open_schedule_id: null,
     unlock_duration: 5,
     reader_type: 'wiegand',
     listen_port: null,
@@ -90,6 +91,20 @@ function DoorFormModal({
     setForm({ ...form, gate_config: { ...current, [section]: sectionData } });
   };
 
+  const updateDoubleGateIO = (
+    section: 'inputs' | 'outputs',
+    lane: 'inbound' | 'outbound',
+    action: 'open' | 'stop' | 'close',
+    patch: Partial<GateIO>
+  ) => {
+    const current = (form.gate_config || {}) as GateConfig;
+    const sectionData = { ...(current[section] || {}) } as Record<string, unknown>;
+    const laneData = { ...((sectionData[lane] || {}) as Record<string, GateIO>) };
+    laneData[action] = { ...(laneData[action] || { enabled: false, pin: null }), ...patch };
+    sectionData[lane] = laneData;
+    setForm({ ...form, gate_config: { ...current, [section]: sectionData } });
+  };
+
   const updateAdvanced = (patch: Partial<NonNullable<GateConfig['advanced']>>) => {
     const current = (form.gate_config || {}) as GateConfig;
     setForm({ ...form, gate_config: { ...current, advanced: { ...(current.advanced || {}), ...patch } } });
@@ -114,7 +129,7 @@ function DoorFormModal({
   // Compute pins currently in use by other features in this form.
   // Pass excludeSelf to exclude the field that's calling this (so its own pin doesn't filter itself out).
   type SelfRef =
-    | { kind: 'gate'; section: 'inputs' | 'outputs'; name: 'open' | 'stop' | 'close' | 'clearance' }
+    | { kind: 'gate'; section: 'inputs' | 'outputs'; name: string }
     | { kind: 'led' }
     | { kind: 'sensor' };
 
@@ -136,6 +151,14 @@ function DoorFormModal({
         if (excludeSelf?.kind === 'gate' && excludeSelf.section === section && excludeSelf.name === name) continue;
         const entry = (form.gate_config?.[section] as Record<string, GateIO> | undefined)?.[name];
         if (entry?.enabled && entry.pin != null) used.set(entry.pin, labelMap[`${section}.${name}`] || `${section} ${name}`);
+      }
+    }
+    for (const section of ['inputs', 'outputs'] as const) {
+      for (const lane of ['inbound', 'outbound'] as const) {
+        for (const action of ['open', 'stop', 'close'] as const) {
+          const entry = ((form.gate_config?.[section] as Record<string, Record<string, GateIO>> | undefined)?.[lane]?.[action]);
+          if (entry?.enabled && entry.pin != null) used.set(entry.pin, `${lane} ${action} ${section === 'inputs' ? 'button' : 'relay'}`);
+        }
       }
     }
     // Status LED
@@ -251,6 +274,49 @@ function DoorFormModal({
                   <option value="clear">Active = path clear</option>
                   <option value="blocked">Active = path blocked</option>
                 </select>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderDoubleGateIORow = (
+    section: 'inputs' | 'outputs',
+    lane: 'inbound' | 'outbound',
+    action: 'open' | 'stop' | 'close'
+  ) => {
+    const laneData = ((form.gate_config?.[section] as Record<string, Record<string, GateIO>> | undefined)?.[lane]) || {};
+    const cfg = laneData[action] || { enabled: false, pin: null };
+    return (
+      <div className="rounded-md border border-slate-200 p-3 dark:border-slate-700">
+        <label className="flex items-center justify-between gap-2 text-sm font-medium text-slate-700 dark:text-slate-300">
+          <span>{action.charAt(0).toUpperCase() + action.slice(1)} {lane} {section === 'inputs' ? 'button' : 'relay'}</span>
+          <input
+            type="checkbox"
+            checked={!!cfg.enabled}
+            onChange={(e) => updateDoubleGateIO(section, lane, action, { enabled: e.target.checked })}
+            className="rounded border-slate-300"
+          />
+        </label>
+        {cfg.enabled && (
+          <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <div>
+              <label className="label text-xs">GPIO Pin</label>
+              {renderPinSelect(cfg.pin, (v) => updateDoubleGateIO(section, lane, action, { pin: v }), { kind: 'gate', section, name: `${lane}.${action}` })}
+            </div>
+            <div>
+              <label className="label text-xs">Active state</label>
+              <select className="input" value={cfg.active_high === false ? 'low' : 'high'} onChange={(e) => updateDoubleGateIO(section, lane, action, { active_high: e.target.value === 'high' })}>
+                <option value="high">High (3.3V)</option>
+                <option value="low">Low (GND)</option>
+              </select>
+            </div>
+            {section === 'outputs' && (
+              <div>
+                <label className="label text-xs">Hold (sec)</label>
+                <input type="number" min={1} max={300} className="input" value={cfg.duration_seconds ?? 30} onChange={(e) => updateDoubleGateIO(section, lane, action, { duration_seconds: parseInt(e.target.value) || 30 })} />
               </div>
             )}
           </div>
@@ -418,7 +484,7 @@ function DoorFormModal({
                 checked={!!form.is_gate}
                 onChange={(e) => {
                   const en = e.target.checked;
-                  setForm({ ...form, is_gate: en ? 1 : 0, gate_config: en ? (form.gate_config || {}) : null });
+                  setForm({ ...form, is_gate: en ? 1 : 0, gate_config: en ? (form.gate_config || { double_gate: false }) : null });
                   setGateExpanded(en);
                 }}
                 className="rounded border-slate-300"
@@ -427,6 +493,15 @@ function DoorFormModal({
             </label>
             {!!form.is_gate && (
               <div className="mt-3 space-y-3">
+                <label className="flex items-center justify-between gap-2 rounded-md border border-slate-200 p-3 text-sm font-medium text-slate-700 dark:border-slate-700 dark:text-slate-300">
+                  <span>Double gate mode</span>
+                  <input
+                    type="checkbox"
+                    checked={!!form.gate_config?.double_gate}
+                    onChange={(e) => setForm({ ...form, gate_config: { ...(form.gate_config || {}), double_gate: e.target.checked } })}
+                    className="rounded border-slate-300"
+                  />
+                </label>
                 <div className="flex items-center justify-between">
                   <button
                     type="button"
@@ -441,11 +516,28 @@ function DoorFormModal({
                   <div className="space-y-4 rounded-md bg-slate-50 p-3 dark:bg-slate-800">
                     <div>
                       <h4 className="mb-2 text-xs font-semibold uppercase text-slate-500">Inputs (physical buttons)</h4>
-                      <div className="space-y-2">
-                        {renderGateIORow('inputs', 'open', 'Open button')}
-                        {renderGateIORow('inputs', 'stop', 'Stop button')}
-                        {renderGateIORow('inputs', 'close', 'Close button')}
-                      </div>
+                      {form.gate_config?.double_gate ? (
+                        <div className="space-y-3">
+                          <div className="space-y-2">
+                            <h5 className="text-xs font-semibold uppercase text-slate-500">Inbound gate</h5>
+                            {renderDoubleGateIORow('inputs', 'inbound', 'open')}
+                            {renderDoubleGateIORow('inputs', 'inbound', 'stop')}
+                            {renderDoubleGateIORow('inputs', 'inbound', 'close')}
+                          </div>
+                          <div className="space-y-2">
+                            <h5 className="text-xs font-semibold uppercase text-slate-500">Outbound gate</h5>
+                            {renderDoubleGateIORow('inputs', 'outbound', 'open')}
+                            {renderDoubleGateIORow('inputs', 'outbound', 'stop')}
+                            {renderDoubleGateIORow('inputs', 'outbound', 'close')}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          {renderGateIORow('inputs', 'open', 'Open button')}
+                          {renderGateIORow('inputs', 'stop', 'Stop button')}
+                          {renderGateIORow('inputs', 'close', 'Close button')}
+                        </div>
+                      )}
                     </div>
                     <div>
                       <h4 className="mb-2 text-xs font-semibold uppercase text-slate-500">Safety sensor</h4>
@@ -458,11 +550,28 @@ function DoorFormModal({
                     </div>
                     <div>
                       <h4 className="mb-2 text-xs font-semibold uppercase text-slate-500">Outputs (relays to gate motor)</h4>
-                      <div className="space-y-2">
-                        {renderGateIORow('outputs', 'open', 'Open relay')}
-                        {renderGateIORow('outputs', 'stop', 'Stop relay')}
-                        {renderGateIORow('outputs', 'close', 'Close relay')}
-                      </div>
+                      {form.gate_config?.double_gate ? (
+                        <div className="space-y-3">
+                          <div className="space-y-2">
+                            <h5 className="text-xs font-semibold uppercase text-slate-500">Inbound gate</h5>
+                            {renderDoubleGateIORow('outputs', 'inbound', 'open')}
+                            {renderDoubleGateIORow('outputs', 'inbound', 'stop')}
+                            {renderDoubleGateIORow('outputs', 'inbound', 'close')}
+                          </div>
+                          <div className="space-y-2">
+                            <h5 className="text-xs font-semibold uppercase text-slate-500">Outbound gate</h5>
+                            {renderDoubleGateIORow('outputs', 'outbound', 'open')}
+                            {renderDoubleGateIORow('outputs', 'outbound', 'stop')}
+                            {renderDoubleGateIORow('outputs', 'outbound', 'close')}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          {renderGateIORow('outputs', 'open', 'Open relay')}
+                          {renderGateIORow('outputs', 'stop', 'Stop relay')}
+                          {renderGateIORow('outputs', 'close', 'Close relay')}
+                        </div>
+                      )}
                     </div>
                     {/* Auto-close */}
                     {(() => {
@@ -571,6 +680,26 @@ function DoorFormModal({
                 )}
               </div>
             )}
+          </div>
+
+          {/* ── STATUS LED ── */}
+          <div className="border-t border-slate-200 pt-4 dark:border-slate-700">
+            <label className="label">Hold Open Schedule</label>
+            <select
+              className="input"
+              value={form.hold_open_schedule_id ?? ''}
+              onChange={(e) => setForm({ ...form, hold_open_schedule_id: e.target.value ? parseInt(e.target.value) : null })}
+            >
+              <option value="">None</option>
+              {schedules.map((schedule) => (
+                <option key={schedule.id} value={schedule.id}>
+                  {schedule.name}{schedule.is_24_7 ? ' (24/7)' : ''}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+              Automatically holds this door or gate open during the selected schedule. Manual release suppresses it until the next schedule period.
+            </p>
           </div>
 
           {/* ── STATUS LED ── */}
@@ -710,9 +839,9 @@ export function DoorsPage() {
     }
   };
 
-  const handleGateCmd = async (name: string, action: 'open' | 'close' | 'stop' | 'hold' | 'release', force?: boolean) => {
+  const handleGateCmd = async (name: string, action: 'open' | 'close' | 'stop' | 'hold' | 'release', force?: boolean, lane?: 'inbound' | 'outbound') => {
     try {
-      await gateCommand(name, action, force);
+      await gateCommand(name, action, force, lane);
       toast.success(`${name}: ${action}`);
       queryClient.invalidateQueries({ queryKey: ['doors'] });
     } catch (err) {
@@ -757,6 +886,14 @@ export function DoorsPage() {
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {doors.map((door) => {
             const isOnline = door.status === 'online';
+            const isDoubleGate = !!door.is_gate && !!door.gate_config?.double_gate;
+            const inboundState = door.gate_inbound_state || door.gate_state;
+            const outboundState = door.gate_outbound_state || door.gate_state;
+            const gateStateClass = (state: typeof door.gate_state) =>
+              state === 'open' ? 'badge-warning' :
+              state === 'closed' ? 'badge-success' :
+              state === 'opening' || state === 'closing' ? 'badge-info' :
+              state === 'stopped' ? 'badge-danger' : 'badge-secondary';
             return (
               <div key={door.name} className="card p-5">
                 <div className="flex items-start justify-between">
@@ -792,17 +929,26 @@ export function DoorsPage() {
                     {door.status.charAt(0).toUpperCase() + door.status.slice(1)}
                   </span>
 
-                  {isOnline && door.is_gate ? (
+                  {isOnline && door.is_gate && !isDoubleGate ? (
                     <>
-                      <span className={`badge ${
-                        door.gate_state === 'open' ? 'badge-warning' :
-                        door.gate_state === 'closed' ? 'badge-success' :
-                        door.gate_state === 'opening' || door.gate_state === 'closing' ? 'badge-info' :
-                        door.gate_state === 'stopped' ? 'badge-danger' : 'badge-secondary'
-                      }`}>
+                      <span className={`badge ${gateStateClass(door.gate_state)}`}>
                         Gate: {door.gate_state}
                       </span>
                       {door.gate_held ? <span className="badge badge-warning">Held</span> : null}
+                    </>
+                  ) : isOnline && isDoubleGate ? (
+                    <>
+                      <span className="badge badge-secondary">Double Gate</span>
+                      {door.gate_held ? <span className="badge badge-warning">Held Both</span> : null}
+                      {door.gate_held ? (
+                        <button onClick={() => handleGateCmd(door.name, 'release')} className="btn btn-sm btn-danger">
+                          <LockOpen className="h-3 w-3" /> Release Both
+                        </button>
+                      ) : (
+                        <button onClick={() => handleGateCmd(door.name, 'hold')} className="btn btn-sm btn-ghost">
+                          <Lock className="h-3 w-3" /> Hold-Open
+                        </button>
+                      )}
                     </>
                   ) : isOnline && (
                     door.held_open ? (
@@ -834,61 +980,46 @@ export function DoorsPage() {
                 )}
 
                 {isOnline && door.is_gate ? (
-                  <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3 dark:border-slate-700">
-                    <button
-                      onClick={() => handleGateCmd(door.name, 'open')}
-                      className="btn btn-sm btn-success"
-                      disabled={!!door.gate_held}
-                      title={door.gate_held ? 'Release hold first' : 'Open gate'}
-                    >
-                      <ArrowUp className="h-3 w-3" />
-                      Open
-                    </button>
-                    <button
-                      onClick={() => handleGateCmd(door.name, 'stop')}
-                      className="btn btn-sm btn-warning"
-                      disabled={door.gate_state !== 'opening' && door.gate_state !== 'closing'}
-                      title={door.gate_state !== 'opening' && door.gate_state !== 'closing' ? 'Gate is not moving' : 'Stop gate'}
-                    >
-                      <Square className="h-3 w-3" />
-                      Stop
-                    </button>
-                    <button
-                      onClick={() => handleGateCmd(door.name, 'close')}
-                      className="btn btn-sm btn-secondary"
-                      disabled={!!door.gate_held}
-                      title={door.gate_held ? 'Release hold first' : 'Close gate'}
-                    >
-                      <ArrowDown className="h-3 w-3" />
-                      Close
-                    </button>
-                    {door.gate_held ? (
-                      <button
-                        onClick={() => handleGateCmd(door.name, 'release')}
-                        className="btn btn-sm btn-danger"
-                      >
-                        <LockOpen className="h-3 w-3" />
-                        Release
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => handleGateCmd(door.name, 'hold')}
-                        className="btn btn-sm btn-ghost"
-                      >
-                        <Lock className="h-3 w-3" />
-                        Hold
-                      </button>
-                    )}
-                    {door.listen_port && (
-                      <button
-                        onClick={() => handlePing(door.name)}
-                        className="btn btn-sm btn-ghost"
-                        title="Ping controller"
-                      >
-                        <Radio className="h-3 w-3" />
-                      </button>
-                    )}
-                  </div>
+                  isDoubleGate ? (
+                    <div className="mt-3 space-y-2 border-t border-slate-100 pt-3 dark:border-slate-700">
+                      {(['Inbound', 'Outbound'] as const).map((label, index) => {
+                        const laneName = label.toLowerCase() as 'inbound' | 'outbound';
+                        const laneState = laneName === 'inbound' ? inboundState : outboundState;
+                        const isMoving = laneState === 'opening' || laneState === 'closing';
+                        return (
+                          <div key={laneName}>
+                            <div className="rounded-md bg-slate-50 p-2 dark:bg-slate-800">
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm font-semibold text-slate-700 dark:text-slate-300">{label}</span>
+                                <span className={`badge ${gateStateClass(laneState)}`}>{laneState}</span>
+                              </div>
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                <button onClick={() => handleGateCmd(door.name, 'open', false, laneName)} className="btn btn-sm btn-success" disabled={!!door.gate_held} title={door.gate_held ? 'Release hold first' : `Open ${label.toLowerCase()} gate`}>
+                                  <ArrowUp className="h-3 w-3" /> Open
+                                </button>
+                                <button onClick={() => handleGateCmd(door.name, 'stop', false, laneName)} className="btn btn-sm btn-warning" disabled={!isMoving} title={!isMoving ? 'Gate is not moving' : `Stop ${label.toLowerCase()} gate`}>
+                                  <Square className="h-3 w-3" /> Stop
+                                </button>
+                                <button onClick={() => handleGateCmd(door.name, 'close', false, laneName)} className="btn btn-sm btn-secondary" disabled={!!door.gate_held} title={door.gate_held ? 'Release hold first' : `Close ${label.toLowerCase()} gate`}>
+                                  <ArrowDown className="h-3 w-3" /> Close
+                                </button>
+                              </div>
+                            </div>
+                            {index === 0 && <div className="my-2 border-t border-slate-200 dark:border-slate-700" />}
+                          </div>
+                        );
+                      })}
+                      {door.listen_port && <button onClick={() => handlePing(door.name)} className="btn btn-sm btn-ghost" title="Ping controller"><Radio className="h-3 w-3" /></button>}
+                    </div>
+                  ) : (
+                    <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3 dark:border-slate-700">
+                      <button onClick={() => handleGateCmd(door.name, 'open')} className="btn btn-sm btn-success" disabled={!!door.gate_held} title={door.gate_held ? 'Release hold first' : 'Open gate'}><ArrowUp className="h-3 w-3" /> Open</button>
+                      <button onClick={() => handleGateCmd(door.name, 'stop')} className="btn btn-sm btn-warning" disabled={door.gate_state !== 'opening' && door.gate_state !== 'closing'} title={door.gate_state !== 'opening' && door.gate_state !== 'closing' ? 'Gate is not moving' : 'Stop gate'}><Square className="h-3 w-3" /> Stop</button>
+                      <button onClick={() => handleGateCmd(door.name, 'close')} className="btn btn-sm btn-secondary" disabled={!!door.gate_held} title={door.gate_held ? 'Release hold first' : 'Close gate'}><ArrowDown className="h-3 w-3" /> Close</button>
+                      {door.gate_held ? <button onClick={() => handleGateCmd(door.name, 'release')} className="btn btn-sm btn-danger"><LockOpen className="h-3 w-3" /> Release</button> : <button onClick={() => handleGateCmd(door.name, 'hold')} className="btn btn-sm btn-ghost"><Lock className="h-3 w-3" /> Hold</button>}
+                      {door.listen_port && <button onClick={() => handlePing(door.name)} className="btn btn-sm btn-ghost" title="Ping controller"><Radio className="h-3 w-3" /></button>}
+                    </div>
+                  )
                 ) : isOnline && !door.unlock_requested && (
                   <div className="mt-3 flex gap-2 border-t border-slate-100 pt-3 dark:border-slate-700">
                     {door.held_open ? (

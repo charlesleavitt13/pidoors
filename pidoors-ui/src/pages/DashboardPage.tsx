@@ -107,9 +107,9 @@ function DoorStatusItem({
 
   const [showClearanceWarning, setShowClearanceWarning] = useState(false);
 
-  const handleGate = async (action: 'open' | 'close' | 'stop' | 'hold' | 'release', force?: boolean) => {
+  const handleGate = async (action: 'open' | 'close' | 'stop' | 'hold' | 'release', force?: boolean, lane?: 'inbound' | 'outbound') => {
     try {
-      await gateCommand(door.name, action, force);
+      await gateCommand(door.name, action, force, lane);
       toast.success(`${door.name}: ${action}`);
       onAction();
     } catch (err) {
@@ -130,6 +130,9 @@ function DoorStatusItem({
     );
 
   const isGate = !!door.is_gate;
+  const isDoubleGate = isGate && !!door.gate_config?.double_gate;
+  const inboundState = door.gate_inbound_state || door.gate_state;
+  const outboundState = door.gate_outbound_state || door.gate_state;
   let stateBadge = null;
   if (door.status === 'online') {
     if (isGate) {
@@ -140,7 +143,19 @@ function DoorStatusItem({
         door.gate_state === 'stopped' ? 'badge-danger' : 'badge-secondary';
       stateBadge = (
         <>
-          <span className={`badge ${cls}`}>Gate: {door.gate_state}</span>
+          {isDoubleGate ? (
+            <>
+              <span className="badge badge-secondary">Double Gate</span>
+              <span className={`badge ${inboundState === 'opening' || inboundState === 'open' ? 'badge-info' : 'badge-secondary'}`}>
+                Inbound: {inboundState}
+              </span>
+              <span className={`badge ${outboundState === 'opening' || outboundState === 'open' ? 'badge-info' : 'badge-secondary'}`}>
+                Outbound: {outboundState}
+              </span>
+            </>
+          ) : (
+            <span className={`badge ${cls}`}>Gate: {door.gate_state}</span>
+          )}
           {door.gate_held ? <span className="badge badge-warning">Held</span> : null}
         </>
       );
@@ -188,16 +203,16 @@ function DoorStatusItem({
         {door.status === 'online' && isAdmin && isGate && (
           <>
             <button
-              onClick={() => handleGate('open')}
+              onClick={() => handleGate('open', false, isDoubleGate ? 'inbound' : undefined)}
               className="btn btn-sm btn-success"
               disabled={!!door.gate_held}
               title={door.gate_held ? 'Release hold first' : 'Open gate'}
             >
               <ArrowUp className="h-3 w-3" />
-              Open
+              {isDoubleGate ? 'Inbound' : 'Open'}
             </button>
             <button
-              onClick={() => handleGate('stop')}
+              onClick={() => handleGate('stop', false, isDoubleGate ? 'inbound' : undefined)}
               className="btn btn-sm btn-warning"
               disabled={door.gate_state !== 'opening' && door.gate_state !== 'closing'}
               title={door.gate_state !== 'opening' && door.gate_state !== 'closing' ? 'Gate is not moving' : 'Stop gate'}
@@ -206,13 +221,13 @@ function DoorStatusItem({
               Stop
             </button>
             <button
-              onClick={() => handleGate('close')}
+              onClick={() => handleGate('close', false, isDoubleGate ? 'outbound' : undefined)}
               className="btn btn-sm btn-secondary"
               disabled={!!door.gate_held}
               title={door.gate_held ? 'Release hold first' : 'Close gate'}
             >
               <ArrowDown className="h-3 w-3" />
-              Close
+              {isDoubleGate ? 'Outbound' : 'Close'}
             </button>
             {door.gate_held ? (
               <button onClick={() => handleGate('release')} className="btn btn-sm btn-danger">

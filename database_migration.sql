@@ -312,6 +312,13 @@ PREPARE stmt FROM @sqlstmt;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
 
+-- hold_open_schedule_id: optional schedule that automatically holds this door/gate open
+SET @exist := (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'doors' AND column_name = 'hold_open_schedule_id');
+SET @sqlstmt := IF(@exist = 0, 'ALTER TABLE `doors` ADD COLUMN `hold_open_schedule_id` int(11) DEFAULT NULL AFTER `schedule_id`', 'SELECT 1');
+PREPARE stmt FROM @sqlstmt;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
 -- Add unlock_duration column if not exists
 SET @exist := (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'doors' AND column_name = 'unlock_duration');
 SET @sqlstmt := IF(@exist = 0, 'ALTER TABLE `doors` ADD COLUMN `unlock_duration` int(11) DEFAULT 5 AFTER `schedule_id`', 'SELECT 1');
@@ -716,12 +723,21 @@ PREPARE stmt FROM @sqlstmt;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
 
--- gate_state: current gate state (only meaningful when is_gate=1)
 SET @exist := (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'doors' AND column_name = 'gate_state');
 SET @sqlstmt := IF(@exist = 0, 'ALTER TABLE `doors` ADD COLUMN `gate_state` enum(\'idle\',\'opening\',\'closing\',\'stopped\',\'open\',\'closed\') DEFAULT \'idle\' AFTER `is_gate`', 'SELECT 1');
 PREPARE stmt FROM @sqlstmt;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
+
+-- Independent state for each lane in double-gate mode. The legacy gate_state
+-- remains for backwards compatibility and represents the latest gate action.
+SET @exist := (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'doors' AND column_name = 'gate_inbound_state');
+SET @sqlstmt := IF(@exist = 0, 'ALTER TABLE `doors` ADD COLUMN `gate_inbound_state` enum(\'idle\',\'opening\',\'closing\',\'stopped\',\'open\',\'closed\') DEFAULT \'idle\' AFTER `gate_state`', 'SELECT 1');
+PREPARE stmt FROM @sqlstmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @exist := (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'doors' AND column_name = 'gate_outbound_state');
+SET @sqlstmt := IF(@exist = 0, 'ALTER TABLE `doors` ADD COLUMN `gate_outbound_state` enum(\'idle\',\'opening\',\'closing\',\'stopped\',\'open\',\'closed\') DEFAULT \'idle\' AFTER `gate_inbound_state`', 'SELECT 1');
+PREPARE stmt FROM @sqlstmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- gate_held: when 1, gate ignores movement commands until released
 SET @exist := (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'doors' AND column_name = 'gate_held');

@@ -235,7 +235,10 @@ function validate_gate_pins(PDO $pdo, string $door_name, array $cfg, array $inpu
     $reserved = get_reserved_pins($door, $input);
     $used = [];
 
-    $sections = ['inputs' => ['open', 'stop', 'close', 'clearance'], 'outputs' => ['open', 'stop', 'close']];
+    $sections = [
+        'inputs' => ['open', 'stop', 'close', 'clearance'],
+        'outputs' => ['open', 'stop', 'close'],
+    ];
     foreach ($sections as $section => $names) {
         foreach ($names as $name) {
             $entry = $cfg[$section][$name] ?? null;
@@ -247,6 +250,24 @@ function validate_gate_pins(PDO $pdo, string $door_name, array $cfg, array $inpu
             if (isset($reserved[$pin])) return "GPIO $pin is already used by {$reserved[$pin]} (gate $section.$name)";
             if (isset($used[$pin])) return "GPIO $pin assigned to multiple gate features ({$used[$pin]} and $section.$name)";
             $used[$pin] = "$section.$name";
+        }
+    }
+    if (!empty($cfg['double_gate'])) {
+        foreach (['inputs', 'outputs'] as $section) {
+            foreach (['inbound', 'outbound'] as $lane) {
+                foreach (['open', 'stop', 'close'] as $name) {
+                    $entry = $cfg[$section][$lane][$name] ?? null;
+                    if (!$entry || empty($entry['enabled'])) continue;
+                    $pin = $entry['pin'] ?? null;
+                    if ($pin === null || $pin === '') continue;
+                    $pin = (int)$pin;
+                    $label = "$section.$lane.$name";
+                    if ($pin <= 0 || $pin > 27) return "Invalid pin number for gate $label: $pin";
+                    if (isset($reserved[$pin])) return "GPIO $pin is already used by {$reserved[$pin]} (gate $label)";
+                    if (isset($used[$pin])) return "GPIO $pin assigned to multiple gate features ({$used[$pin]} and $label)";
+                    $used[$pin] = $label;
+                }
+            }
         }
     }
 
@@ -314,6 +335,16 @@ function validate_status_led_pin(PDO $pdo, string $door_name, array $cfg, array 
                 $entry = $gate_cfg[$section][$name] ?? null;
                 if ($entry && !empty($entry['enabled']) && (int)($entry['pin'] ?? 0) === $pin) {
                     return "GPIO $pin is already used by gate $section.$name";
+                }
+            }
+        }
+        foreach (['inputs', 'outputs'] as $section) {
+            foreach (['inbound', 'outbound'] as $lane) {
+                foreach (['open', 'stop', 'close'] as $name) {
+                    $entry = $gate_cfg[$section][$lane][$name] ?? null;
+                    if ($entry && !empty($entry['enabled']) && (int)($entry['pin'] ?? 0) === $pin) {
+                        return "GPIO $pin is already used by gate $section.$lane.$name";
+                    }
                 }
             }
         }
@@ -478,7 +509,7 @@ if ($resource === 'dashboard' && $method === 'GET') {
         $today_granted = (int)$pdo_access->query("SELECT COUNT(*) FROM logs WHERE DATE(Date) = CURDATE() AND Granted = 1")->fetchColumn();
         $today_denied = (int)$pdo_access->query("SELECT COUNT(*) FROM logs WHERE DATE(Date) = CURDATE() AND Granted = 0")->fetchColumn();
 
-        $doors = $pdo_access->query("SELECT name, location, status, locked, held_open, hold_requested, unlock_requested, push_available, door_sensor_gpio, door_open, door_sensor_invert, is_gate, gate_state, gate_held FROM doors ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
+        $doors = $pdo_access->query("SELECT name, location, status, locked, held_open, hold_requested, unlock_requested, push_available, door_sensor_gpio, door_open, door_sensor_invert, is_gate, gate_state, gate_inbound_state, gate_outbound_state, gate_held, gate_config, hold_open_schedule_id FROM doors ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
         // Cast numeric fields
         foreach ($doors as &$d) {
             $d['locked'] = (int)$d['locked'];
@@ -491,7 +522,11 @@ if ($resource === 'dashboard' && $method === 'GET') {
             $d['door_sensor_invert'] = (int)($d['door_sensor_invert'] ?? 0);
             $d['is_gate'] = (int)($d['is_gate'] ?? 0);
             $d['gate_state'] = $d['gate_state'] ?? 'idle';
+            $d['gate_inbound_state'] = $d['gate_inbound_state'] ?? $d['gate_state'];
+            $d['gate_outbound_state'] = $d['gate_outbound_state'] ?? $d['gate_state'];
             $d['gate_held'] = (int)($d['gate_held'] ?? 0);
+            $d['hold_open_schedule_id'] = $d['hold_open_schedule_id'] !== null ? (int)$d['hold_open_schedule_id'] : null;
+            $d['gate_config'] = !empty($d['gate_config']) ? json_decode($d['gate_config'], true) : null;
         }
         unset($d);
 
@@ -557,6 +592,7 @@ if ($resource === 'doors') {
             $d['is_gate'] = (int)($d['is_gate'] ?? 0);
             $d['gate_state'] = $d['gate_state'] ?? 'idle';
             $d['gate_held'] = (int)($d['gate_held'] ?? 0);
+            $d['hold_open_schedule_id'] = $d['hold_open_schedule_id'] !== null ? (int)$d['hold_open_schedule_id'] : null;
             $d['gate_config'] = !empty($d['gate_config']) ? json_decode($d['gate_config'], true) : null;
             $d['status_led_config'] = !empty($d['status_led_config']) ? json_decode($d['status_led_config'], true) : null;
             unset($d['api_key']); // Never expose API key to browser
@@ -579,6 +615,8 @@ if ($resource === 'doors') {
             if (isset($ping['version'])) $sets['controller_version'] = $ping['version'];
             if (array_key_exists('door_open', $ping)) $sets['door_open'] = $ping['door_open'];
             if (isset($ping['gate_state'])) $sets['gate_state'] = $ping['gate_state'];
+            if (isset($ping['gate_inbound_state'])) $sets['gate_inbound_state'] = $ping['gate_inbound_state'];
+            if (isset($ping['gate_outbound_state'])) $sets['gate_outbound_state'] = $ping['gate_outbound_state'];
             if (isset($ping['gate_held'])) $sets['gate_held'] = !empty($ping['gate_held']) ? 1 : 0;
             $cols = []; $vals = [];
             foreach ($sets as $col => $val) { $cols[] = "$col = ?"; $vals[] = $val; }
@@ -603,7 +641,10 @@ if ($resource === 'doors') {
         $door['door_sensor_invert'] = (int)($door['door_sensor_invert'] ?? 0);
         $door['is_gate'] = (int)($door['is_gate'] ?? 0);
         $door['gate_state'] = $door['gate_state'] ?? 'idle';
+        $door['gate_inbound_state'] = $door['gate_inbound_state'] ?? $door['gate_state'];
+        $door['gate_outbound_state'] = $door['gate_outbound_state'] ?? $door['gate_state'];
         $door['gate_held'] = (int)($door['gate_held'] ?? 0);
+        $door['hold_open_schedule_id'] = $door['hold_open_schedule_id'] !== null ? (int)$door['hold_open_schedule_id'] : null;
         $door['gate_config'] = !empty($door['gate_config']) ? json_decode($door['gate_config'], true) : null;
         $door['status_led_config'] = !empty($door['status_led_config']) ? json_decode($door['status_led_config'], true) : null;
         unset($door['api_key']);
@@ -635,6 +676,16 @@ if ($resource === 'doors') {
                     $entry = $cfg[$section][$name] ?? null;
                     if ($entry && !empty($entry['enabled']) && !empty($entry['pin'])) {
                         $reserved[(int)$entry['pin']] = "Gate $section.$name";
+                    }
+                }
+            }
+            foreach (['inputs', 'outputs'] as $section) {
+                foreach (['inbound', 'outbound'] as $lane) {
+                    foreach (['open', 'stop', 'close'] as $name) {
+                        $entry = $cfg[$section][$lane][$name] ?? null;
+                        if ($entry && !empty($entry['enabled']) && !empty($entry['pin'])) {
+                            $reserved[(int)$entry['pin']] = "Gate $section.$lane.$name";
+                        }
                     }
                 }
             }
@@ -675,7 +726,14 @@ if ($resource === 'doors') {
             $reader_type = 'wiegand';
         }
 
-        $stmt = $pdo_access->prepare("INSERT INTO doors (name, location, doornum, description, ip_address, schedule_id, unlock_duration, reader_type, poll_interval, listen_port, door_sensor_gpio, door_sensor_invert, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown')");
+        $hold_open_schedule_id = !empty($input['hold_open_schedule_id']) ? (int)$input['hold_open_schedule_id'] : null;
+        if ($hold_open_schedule_id !== null) {
+            $schedule_stmt = $pdo_access->prepare("SELECT id FROM access_schedules WHERE id = ?");
+            $schedule_stmt->execute([$hold_open_schedule_id]);
+            if (!$schedule_stmt->fetchColumn()) json_error('Hold Open Schedule not found');
+        }
+
+        $stmt = $pdo_access->prepare("INSERT INTO doors (name, location, doornum, description, ip_address, schedule_id, hold_open_schedule_id, unlock_duration, reader_type, poll_interval, listen_port, door_sensor_gpio, door_sensor_invert, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown')");
         $stmt->execute([
             $name,
             sanitize_string($input['location'] ?? ''),
@@ -683,6 +741,7 @@ if ($resource === 'doors') {
             sanitize_string($input['description'] ?? ''),
             sanitize_string($input['ip_address'] ?? ''),
             !empty($input['schedule_id']) ? (int)$input['schedule_id'] : null,
+            !empty($input['hold_open_schedule_id']) ? (int)$input['hold_open_schedule_id'] : null,
             (int)($input['unlock_duration'] ?? 5),
             $reader_type,
             (int)($input['poll_interval'] ?? 10),
@@ -762,6 +821,16 @@ if ($resource === 'doors') {
             $fields[] = "schedule_id = ?";
             $params[] = !empty($input['schedule_id']) ? (int)$input['schedule_id'] : null;
         }
+        if (array_key_exists('hold_open_schedule_id', $input)) {
+            $hold_schedule_id = !empty($input['hold_open_schedule_id']) ? (int)$input['hold_open_schedule_id'] : null;
+            if ($hold_schedule_id !== null) {
+                $schedule_stmt = $pdo_access->prepare("SELECT id FROM access_schedules WHERE id = ?");
+                $schedule_stmt->execute([$hold_schedule_id]);
+                if (!$schedule_stmt->fetchColumn()) json_error('Hold Open Schedule not found');
+            }
+            $fields[] = "hold_open_schedule_id = ?";
+            $params[] = $hold_schedule_id;
+        }
         if (array_key_exists('listen_port', $input)) {
             $fields[] = "listen_port = ?";
             $params[] = !empty($input['listen_port']) ? (int)$input['listen_port'] : null;
@@ -810,7 +879,7 @@ if ($resource === 'doors') {
         $pdo_access->prepare("UPDATE doors SET " . implode(', ', $fields) . " WHERE name = ?")->execute($params);
 
         // Push config change to controller if it's online (gate/LED config changes need a restart)
-        if (array_key_exists('gate_config', $input) || array_key_exists('status_led_config', $input) || array_key_exists('is_gate', $input)) {
+        if (array_key_exists('gate_config', $input) || array_key_exists('status_led_config', $input) || array_key_exists('is_gate', $input) || array_key_exists('hold_open_schedule_id', $input)) {
             require_once __DIR__ . '/includes/push.php';
             @push_to_controller($pdo_access, $door_name, 'reload-config');
         }
@@ -918,6 +987,9 @@ if ($resource === 'doors') {
         $push_cmd = $cmd_map[$action];
         $force = !empty($input['force']);
         $body = $force ? ['force' => true] : [];
+        if (isset($input['lane']) && in_array($input['lane'], ['inbound', 'outbound'], true)) {
+            $body['lane'] = $input['lane'];
+        }
         $result = push_to_controller($pdo_access, $door_name, $push_cmd, $body);
 
         // Distinguish network/transport failure from command-refused.
@@ -943,10 +1015,12 @@ if ($resource === 'doors') {
         }
 
         // Update DB immediately so the UI reflects the new state right away
-        if (isset($result['gate_state']) || isset($result['gate_held'])) {
+        if (isset($result['gate_state']) || isset($result['gate_inbound_state']) || isset($result['gate_outbound_state']) || isset($result['gate_held'])) {
             $sets = [];
             $vals = [];
             if (isset($result['gate_state'])) { $sets[] = 'gate_state = ?'; $vals[] = $result['gate_state']; }
+            if (isset($result['gate_inbound_state'])) { $sets[] = 'gate_inbound_state = ?'; $vals[] = $result['gate_inbound_state']; }
+            if (isset($result['gate_outbound_state'])) { $sets[] = 'gate_outbound_state = ?'; $vals[] = $result['gate_outbound_state']; }
             if (isset($result['gate_held'])) { $sets[] = 'gate_held = ?'; $vals[] = !empty($result['gate_held']) ? 1 : 0; }
             $vals[] = $door_name;
             $pdo_access->prepare("UPDATE doors SET " . implode(', ', $sets) . " WHERE name = ?")->execute($vals);
@@ -975,6 +1049,8 @@ if ($resource === 'doors') {
             if (isset($result['version'])) $sets['controller_version'] = $result['version'];
             if (array_key_exists('door_open', $result)) $sets['door_open'] = $result['door_open'];
             if (isset($result['gate_state'])) $sets['gate_state'] = $result['gate_state'];
+            if (isset($result['gate_inbound_state'])) $sets['gate_inbound_state'] = $result['gate_inbound_state'];
+            if (isset($result['gate_outbound_state'])) $sets['gate_outbound_state'] = $result['gate_outbound_state'];
             if (isset($result['gate_held'])) $sets['gate_held'] = !empty($result['gate_held']) ? 1 : 0;
             $cols = []; $vals = [];
             foreach ($sets as $col => $val) { $cols[] = "$col = ?"; $vals[] = $val; }
