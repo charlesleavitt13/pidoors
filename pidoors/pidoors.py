@@ -1428,9 +1428,89 @@ def _run_soft_open_cycle(lane, cycle_seconds, stop_event):
     gate_set_state(final_state)
 
 
+def _open_output_soft_cycle_seconds(name):
+    """Return the open-cycle duration if that open output has soft_cycle enabled."""
+    entry = _gate_output_config(name)
+    if not entry.get('soft_cycle'):
+        return None
+    return max(1.0, float(entry.get('soft_cycle_seconds', 30)))
+
+
+def _set_lane_gate_state(lane, state):
+    global gate_inbound_state, gate_outbound_state
+    if lane == 'inbound':
+        gate_inbound_state = state
+    elif lane == 'outbound':
+        gate_outbound_state = state
+
+
+def _combined_double_gate_state():
+    states = (gate_inbound_state, gate_outbound_state)
+    for s in ('stopped', 'closing', 'opening'):
+        if s in states:
+            return s
+    if states[0] == states[1]:
+        return states[0]
+    if 'open' in states:
+        return 'open'
+    return 'closed'
+
+
+def _run_soft_close_after_hold(lane_cycles, stop_event):
+    """After hold-open release, report closing for half the soft cycle, then closed.
+
+    The opener closes itself when the hold input drops; no GPIO is driven here.
+    lane_cycles: list of (lane or None, cycle_seconds).
+    """
+    global gate_active_output
+
+    for lane, _seconds in lane_cycles:
+        _set_lane_gate_state(lane, 'closing')
+    gate_set_state('closing', held=False)
+
+    remaining = [(lane, max(0.5, float(seconds) / 2.0)) for lane, seconds in lane_cycles]
+    remaining.sort(key=lambda item: item[1])
+    elapsed = 0.0
+    interrupted = False
+    for lane, half in remaining:
+        wait = half - elapsed
+        if not interrupted and wait > 0:
+            interrupted = bool(stop_event.wait(timeout=wait))
+            if not interrupted:
+                elapsed = half
+        final = 'stopped' if interrupted else 'closed'
+        _set_lane_gate_state(lane, final)
+        if lane is None:
+            gate_set_state(final)
+        else:
+            gate_set_state(_combined_double_gate_state())
+        debug(f"Gate {lane or 'open'} after hold-release -> {final}")
+
+    if interrupted:
+        gate_set_state('stopped')
+    elif lane_cycles and lane_cycles[0][0] is None:
+        gate_set_state('closed')
+    else:
+        gate_set_state(_combined_double_gate_state())
+
+    with gate_lock:
+        if gate_active_output in ('double', 'soft-close'):
+            gate_active_output = None
+    _set_legacy_leds(False)
+
+
+def _should_soft_close_after_hold(double_gate):
+    if double_gate:
+        return (
+            _open_output_soft_cycle_seconds('inbound.open') is not None
+            or _open_output_soft_cycle_seconds('outbound.open') is not None
+        )
+    return _open_output_soft_cycle_seconds('open') is not None
+
+
 def _gate_run_double_hold_open():
     """Open both double-gate lanes and hold both open until released."""
-    global gate_active_output, gate_inbound_state, gate_outbound_state
+    global gate_active_output, gate_inbound_state, gate_outbound_state, gate_stop_event
 
     targets = ('inbound.open', 'outbound.open')
     if not all(_gate_set_output(target, True) for target in targets):
@@ -1453,13 +1533,42 @@ def _gate_run_double_hold_open():
     for target in targets:
         _gate_set_output(target, False)
 
-    with gate_lock:
-        if gate_active_output == 'double':
-            gate_active_output = None
-        gate_inbound_state = 'open'
-        gate_outbound_state = 'open'
     _set_legacy_leds(False)
-    gate_set_state('open', held=False)
+
+    # Stop-during-hold leaves gate_held True; only a real release should
+    # start the soft-cycle close report.
+    if gate_held:
+        with gate_lock:
+            if gate_active_output == 'double':
+                gate_active_output = None
+        return True
+
+    lane_cycles = []
+    inbound_cycle = _open_output_soft_cycle_seconds('inbound.open')
+    outbound_cycle = _open_output_soft_cycle_seconds('outbound.open')
+    if inbound_cycle is not None:
+        lane_cycles.append(('inbound', inbound_cycle))
+    else:
+        gate_inbound_state = 'open'
+    if outbound_cycle is not None:
+        lane_cycles.append(('outbound', outbound_cycle))
+    else:
+        gate_outbound_state = 'open'
+
+    if not lane_cycles:
+        with gate_lock:
+            if gate_active_output == 'double':
+                gate_active_output = None
+        gate_set_state('open', held=False)
+        return True
+
+    # Fresh event: the hold-wait event is already set by release, so a
+    # subsequent wait on it would return immediately.
+    close_event = threading.Event()
+    with gate_lock:
+        gate_stop_event = close_event
+        gate_active_output = 'double'
+    _run_soft_close_after_hold(lane_cycles, close_event)
     return True
 
 
@@ -1490,14 +1599,31 @@ def gate_command(cmd, source='unknown', hold_after=False, lane=None):
         return False, 'held'
 
     if cmd == 'release':
-        if double_gate and gate_held:
-            gate_stop_event.set()
+        was_held = gate_held
+        was_open = (gate_state == 'open')
+        # Clear held before waking the double-gate hold thread so it can tell
+        # release apart from stop (stop leaves gate_held True).
         if source != 'schedule' and hold_open_schedule_active:
             hold_open_schedule_suppressed = True
             hold_open_schedule_active = False
         gate_set_state(gate_state, held=False)
+        if double_gate and was_held:
+            gate_stop_event.set()
         report(f"Gate hold released ({source})")
-        if gate_state == 'open':
+        soft_close = was_held and was_open and _should_soft_close_after_hold(double_gate)
+        if soft_close and not double_gate:
+            cycle_seconds = _open_output_soft_cycle_seconds('open')
+            if cycle_seconds:
+                close_event = threading.Event()
+                with gate_lock:
+                    gate_stop_event = close_event
+                    gate_active_output = 'soft-close'
+                threading.Thread(
+                    target=_run_soft_close_after_hold,
+                    args=([(None, cycle_seconds)], close_event),
+                    daemon=True,
+                ).start()
+        elif was_open and not soft_close:
             _maybe_start_auto_close()
         return True, None
 
