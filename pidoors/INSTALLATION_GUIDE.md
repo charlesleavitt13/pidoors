@@ -758,13 +758,13 @@ For Wiegand keypads with a status LED input pin, you can configure PiDoors to dr
 1. **Create a CSV file** with this format:
 
 ```csv
-card_id,user_id,firstname,lastname,email,department
-12345678,EMP001,John,Smith,john@example.com,Engineering
-23456789,EMP002,Jane,Doe,jane@example.com,Marketing
-34567890,EMP003,Bob,Wilson,bob@example.com,Operations
+card_id,user_id,facility,firstname,lastname,doors,active,email,department
+a1b2c3d4,EMP001,123,John,Smith,front-door,1,john@example.com,Engineering
+b2c3d4e5,EMP002,123,Jane,Doe,front-door,1,jane@example.com,Marketing
+c3d4e5f6,EMP003,123,Bob,Wilson,front-door,1,bob@example.com,Operations
 ```
 
-Only `card_id` and `user_id` are required. Optional columns: `firstname`, `lastname`, `email`, `phone`, `department`, `employee_id`, `company`, `title`, `notes`, `group_id`, `schedule_id`, `valid_from`, `valid_until`, `pin_code`.
+Required: `card_id` and `user_id`. Needed to grant access: `facility` (must match the reader facility code) and `doors` (comma-separated door names, or `*` for all doors). If `doors` is empty and `group_id` is set (or you pick a default access group in the import form), that group's door list is copied onto the card. Optional: `firstname`, `lastname`, `active`, `email`, `phone`, `department`, `employee_id`, `company`, `title`, `notes`, `group_id`, `schedule_id`, `valid_from`, `valid_until`, `daily_scan_limit`, `master`. Keypad PIN is stored in `card_id`; a `pin_code` column is ignored.
 
 2. **Go to "Import CSV"** (from the Cards page)
 3. **Upload your CSV file**

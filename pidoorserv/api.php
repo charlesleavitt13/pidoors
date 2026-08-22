@@ -166,6 +166,45 @@ function require_csrf() {
     }
 }
 
+function csv_normalize_headers(array $header): array {
+    if (isset($header[0])) {
+        $header[0] = preg_replace('/^\xEF\xBB\xBF/', '', (string)$header[0]);
+    }
+    return array_map(function ($h) {
+        return strtolower(trim((string)$h));
+    }, $header);
+}
+
+function csv_copy_group_doors(string $doors, ?int $group_id, array $group_doors_map): string {
+    $doors = trim($doors);
+    if ($doors !== '') {
+        return $doors;
+    }
+    if ($group_id === null || !isset($group_doors_map[$group_id])) {
+        return '';
+    }
+    $decoded = json_decode((string)$group_doors_map[$group_id], true);
+    if (!is_array($decoded) || $decoded === []) {
+        return '';
+    }
+    $names = [];
+    foreach ($decoded as $name) {
+        $name = trim((string)$name);
+        if ($name !== '') {
+            $names[] = $name;
+        }
+    }
+    return implode(',', $names);
+}
+
+function csv_parse_active($value): int {
+    $v = strtolower(trim((string)$value));
+    if ($v === '0' || $v === 'no' || $v === 'false' || $v === 'inactive') {
+        return 0;
+    }
+    return 1;
+}
+
 // ──────────────────────────────────────────────
 // GPIO pin reservation helpers (gate/LED config)
 // ──────────────────────────────────────────────
@@ -1119,99 +1158,150 @@ if ($resource === 'cards') {
         // Read header row
         $header = fgetcsv($handle);
         if (!$header) { fclose($handle); json_error('Empty CSV file'); }
-        $header = array_map('strtolower', array_map('trim', $header));
+        $header = csv_normalize_headers($header);
 
-        $required = ['user_id'];
+        $required = ['card_id', 'user_id'];
         foreach ($required as $col) {
-            if (!in_array($col, $header)) {
+            if (!in_array($col, $header, true)) {
                 fclose($handle);
                 json_error("Missing required column: $col");
             }
         }
 
-        $skip_duplicates = !empty($input['skip_duplicates'] ?? $_POST['skip_duplicates'] ?? true);
+        $skip_raw = strtolower((string)($input['skip_duplicates'] ?? $_POST['skip_duplicates'] ?? '1'));
+        $skip_duplicates = !in_array($skip_raw, ['0', 'false', 'off', 'no', ''], true);
         $default_group = !empty($input['default_group'] ?? $_POST['default_group'] ?? '') ? (int)($input['default_group'] ?? $_POST['default_group']) : null;
         $default_schedule = !empty($input['default_schedule'] ?? $_POST['default_schedule'] ?? '') ? (int)($input['default_schedule'] ?? $_POST['default_schedule']) : null;
+
+        $valid_groups = [];
+        $group_doors_map = [];
+        foreach ($pdo_access->query("SELECT id, doors FROM access_groups") as $g) {
+            $gid = (int)$g['id'];
+            $valid_groups[$gid] = true;
+            $group_doors_map[$gid] = $g['doors'];
+        }
+        $valid_schedules = [];
+        foreach ($pdo_access->query("SELECT id FROM access_schedules") as $s) {
+            $valid_schedules[(int)$s['id']] = true;
+        }
+
+        if ($default_group !== null && !isset($valid_groups[$default_group])) {
+            fclose($handle);
+            json_error("Unknown default_group: $default_group");
+        }
+        if ($default_schedule !== null && !isset($valid_schedules[$default_schedule])) {
+            fclose($handle);
+            json_error("Unknown default_schedule: $default_schedule");
+        }
 
         $imported = 0;
         $skipped = 0;
         $errors_list = [];
+        $warnings_list = [];
+        $line_num = 1;
+        $header_count = count($header);
+
+        $insert_stmt = $pdo_access->prepare("INSERT INTO cards (card_id, user_id, facility, firstname, lastname, doors, active, email, phone, department, employee_id, company, title, notes, group_id, schedule_id, valid_from, valid_until, daily_scan_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        $dup_stmt = $pdo_access->prepare("SELECT id FROM cards WHERE user_id = ? OR card_id = ?");
+        $master_stmt = $pdo_access->prepare("INSERT INTO master_cards (card_id, user_id, facility, description, active) VALUES (?, ?, ?, ?, 1)");
 
         $pdo_access->beginTransaction();
         try {
             while (($row = fgetcsv($handle)) !== false) {
-                if (count($row) !== count($header)) { $skipped++; continue; }
+                $line_num++;
+                if ($row === [null] || (count($row) === 1 && trim((string)$row[0]) === '')) {
+                    continue;
+                }
+                if (count($row) < $header_count) {
+                    $row = array_pad($row, $header_count, '');
+                } elseif (count($row) > $header_count) {
+                    $row = array_slice($row, 0, $header_count);
+                }
                 $data = array_combine($header, $row);
-
-                $user_id = trim($data['user_id'] ?? '');
-                if (empty($user_id)) { $skipped++; continue; }
-
-                // Check if card already exists (by card_id or user_id)
-                $check = $pdo_access->prepare("SELECT id FROM cards WHERE user_id = ?" . (isset($data['card_id']) && !empty(trim($data['card_id'])) ? " OR card_id = ?" : ""));
-                $check_params = [$user_id];
-                if (isset($data['card_id']) && !empty(trim($data['card_id']))) {
-                    $check_params[] = trim($data['card_id']);
-                }
-                $check->execute($check_params);
-                if ($check->fetch()) {
-                    if ($skip_duplicates) { $skipped++; continue; }
+                if ($data === false) {
+                    $errors_list[] = "Line $line_num: could not parse row";
+                    $skipped++;
+                    continue;
                 }
 
-                $group_id = !empty(trim($data['group_id'] ?? '')) ? (int)$data['group_id'] : $default_group;
-                $schedule_id = !empty(trim($data['schedule_id'] ?? '')) ? (int)$data['schedule_id'] : $default_schedule;
+                $user_id = trim((string)($data['user_id'] ?? ''));
+                $csv_card_id = trim((string)($data['card_id'] ?? ''));
+                if ($user_id === '' || $csv_card_id === '') {
+                    $errors_list[] = "Line $line_num: missing required card_id or user_id";
+                    $skipped++;
+                    continue;
+                }
 
-                // The Wiegand-derived card_id is only included when the CSV
-                // actually supplies it. We never invent one server-side — when
-                // absent it stays NULL and the controller enrolls it on first
-                // scan. Storing a fabricated value would break card matching.
-                $csv_card_id = trim($data['card_id'] ?? '');
-                $has_card_id = ($csv_card_id !== '');
+                $dup_stmt->execute([$user_id, $csv_card_id]);
+                if ($dup_stmt->fetch()) {
+                    if ($skip_duplicates) {
+                        $skipped++;
+                        continue;
+                    }
+                }
+
+                $group_id = !empty(trim((string)($data['group_id'] ?? ''))) ? (int)$data['group_id'] : $default_group;
+                $schedule_id = !empty(trim((string)($data['schedule_id'] ?? ''))) ? (int)$data['schedule_id'] : $default_schedule;
+                if ($group_id !== null && !isset($valid_groups[$group_id])) {
+                    $errors_list[] = "Line $line_num ($user_id): unknown group_id $group_id";
+                    $skipped++;
+                    continue;
+                }
+                if ($schedule_id !== null && !isset($valid_schedules[$schedule_id])) {
+                    $errors_list[] = "Line $line_num ($user_id): unknown schedule_id $schedule_id";
+                    $skipped++;
+                    continue;
+                }
+
+                $facility = trim((string)($data['facility'] ?? ''));
+                $doors = csv_copy_group_doors((string)($data['doors'] ?? ''), $group_id, $group_doors_map);
+                $active = csv_parse_active($data['active'] ?? '1');
+
+                if ($facility === '') {
+                    $warnings_list[] = "Line $line_num ($user_id): no facility — a scan may not match this card";
+                }
+                if ($doors === '') {
+                    $warnings_list[] = "Line $line_num ($user_id): no doors assigned — this card cannot open any door";
+                }
 
                 try {
-                    $stmt = $pdo_access->prepare("INSERT INTO cards (" . ($has_card_id ? "card_id, " : "") . "user_id, facility, firstname, lastname, doors, active, email, phone, department, employee_id, company, title, notes, group_id, schedule_id, valid_from, valid_until, pin_code, daily_scan_limit) VALUES (" . ($has_card_id ? "?, " : "") . "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                    $insert_params = [];
-                    if ($has_card_id) {
-                        $insert_params[] = $csv_card_id;
-                    }
-                    array_push($insert_params,
+                    $insert_stmt->execute([
+                        $csv_card_id,
                         $user_id,
-                        trim($data['facility'] ?? ''),
-                        trim($data['firstname'] ?? ''),
-                        trim($data['lastname'] ?? ''),
-                        trim($data['doors'] ?? ''),
-                        (int)($data['active'] ?? 1),
-                        trim($data['email'] ?? ''),
-                        trim($data['phone'] ?? ''),
-                        trim($data['department'] ?? ''),
-                        trim($data['employee_id'] ?? ''),
-                        trim($data['company'] ?? ''),
-                        trim($data['title'] ?? ''),
-                        trim($data['notes'] ?? ''),
+                        $facility,
+                        trim((string)($data['firstname'] ?? '')),
+                        trim((string)($data['lastname'] ?? '')),
+                        $doors,
+                        $active,
+                        trim((string)($data['email'] ?? '')),
+                        trim((string)($data['phone'] ?? '')),
+                        trim((string)($data['department'] ?? '')),
+                        trim((string)($data['employee_id'] ?? '')),
+                        trim((string)($data['company'] ?? '')),
+                        trim((string)($data['title'] ?? '')),
+                        trim((string)($data['notes'] ?? '')),
                         $group_id,
                         $schedule_id,
-                        !empty(trim($data['valid_from'] ?? '')) ? trim($data['valid_from']) : null,
-                        !empty(trim($data['valid_until'] ?? '')) ? trim($data['valid_until']) : null,
-                        trim($data['pin_code'] ?? ''),
-                        !empty(trim($data['daily_scan_limit'] ?? '')) ? min(999, max(0, (int)$data['daily_scan_limit'])) : null
-                    );
-                    $stmt->execute($insert_params);
+                        !empty(trim((string)($data['valid_from'] ?? ''))) ? trim($data['valid_from']) : null,
+                        !empty(trim((string)($data['valid_until'] ?? ''))) ? trim($data['valid_until']) : null,
+                        !empty(trim((string)($data['daily_scan_limit'] ?? ''))) ? min(999, max(0, (int)$data['daily_scan_limit'])) : null,
+                    ]);
 
-                    // Handle master card. master_cards.card_id must hold the REAL
-                    // Wiegand card_id (not the cards-table auto-increment id), so
-                    // the controller can match a scanned master card. Only create
-                    // the entry when the CSV actually supplied a card_id — without
-                    // it there is nothing for the controller to match against.
-                    $is_master = isset($data['master']) && in_array(strtolower(trim($data['master'])), ['1', 'yes', 'true']);
-                    if ($is_master && $has_card_id) {
+                    $is_master = isset($data['master']) && in_array(strtolower(trim((string)$data['master'])), ['1', 'yes', 'true'], true);
+                    if ($is_master) {
                         try {
-                            $pdo_access->prepare("INSERT INTO master_cards (card_id, user_id, facility, description, active) VALUES (?, ?, ?, ?, 1)")
-                                ->execute([$csv_card_id, $user_id, trim($data['facility'] ?? ''), trim($data['firstname'] ?? '') . ' ' . trim($data['lastname'] ?? '')]);
-                        } catch (PDOException $e) { /* master_cards table may not exist */ }
+                            $master_stmt->execute([
+                                $csv_card_id,
+                                $user_id,
+                                $facility,
+                                trim(trim((string)($data['firstname'] ?? '')) . ' ' . trim((string)($data['lastname'] ?? ''))),
+                            ]);
+                        } catch (PDOException $e) { /* master_cards table may not exist or already present */ }
                     }
 
                     $imported++;
                 } catch (PDOException $e) {
-                    $errors_list[] = "Row $user_id: " . $e->getMessage();
+                    $errors_list[] = "Line $line_num ($user_id): " . $e->getMessage();
                     $skipped++;
                 }
             }
@@ -1224,16 +1314,21 @@ if ($resource === 'cards') {
         fclose($handle);
 
         log_security_event($pdo, 'cards_imported', $_SESSION['user_id'], "CSV import: $imported imported, $skipped skipped");
-        json_success(['imported' => $imported, 'skipped' => $skipped, 'errors' => $errors_list], "Imported $imported cards, skipped $skipped");
+        json_success([
+            'imported' => $imported,
+            'skipped' => $skipped,
+            'errors' => $errors_list,
+            'warnings' => $warnings_list,
+        ], "Imported $imported cards, skipped $skipped");
     }
 
     if ($id === 'export' && $method === 'GET') {
         require_admin_auth();
+        // pin_code is excluded: keypad PIN is stored in card_id (Card ID / PIN).
+        // doors and active are included so export → import round-trips.
         $cards = $pdo_access->query("
-            -- pin_code is deliberately excluded: cardholder PINs must never be
-            -- written into a downloadable export. They remain in the DB for the
-            -- controller to match, but are not surfaced to API/CSV consumers.
-            SELECT c.card_id, c.user_id, c.facility, c.firstname, c.lastname, c.email, c.phone,
+            SELECT c.card_id, c.user_id, c.facility, c.firstname, c.lastname,
+                   c.doors, c.active, c.email, c.phone,
                    c.department, c.employee_id, c.company, c.title, c.notes,
                    c.group_id, c.schedule_id, c.valid_from, c.valid_until,
                    c.daily_scan_limit,
@@ -1242,14 +1337,23 @@ if ($resource === 'cards') {
             ORDER BY c.lastname, c.firstname
         ")->fetchAll(PDO::FETCH_ASSOC);
 
+        $columns = [
+            'card_id', 'user_id', 'facility', 'firstname', 'lastname', 'doors', 'active',
+            'email', 'phone', 'department', 'employee_id', 'company', 'title', 'notes',
+            'group_id', 'schedule_id', 'valid_from', 'valid_until', 'daily_scan_limit', 'master',
+        ];
+
         header('Content-Type: text/csv; charset=UTF-8');
         header('Content-Disposition: attachment; filename="cards_export_' . date('Y-m-d') . '.csv"');
         $out = fopen('php://output', 'w');
-        // UTF-8 BOM for Excel compatibility
         fwrite($out, "\xEF\xBB\xBF");
-        if (!empty($cards)) {
-            fputcsv($out, array_keys($cards[0]));
-            foreach ($cards as $card) fputcsv($out, $card);
+        fputcsv($out, $columns);
+        foreach ($cards as $card) {
+            $row = [];
+            foreach ($columns as $col) {
+                $row[] = $card[$col] ?? '';
+            }
+            fputcsv($out, $row);
         }
         fclose($out);
         exit();

@@ -516,12 +516,12 @@ Full wiring diagrams available in [Installation Guide](pidoors/INSTALLATION_GUID
 
 **Via CSV Import:**
 ```csv
-card_id,user_id,firstname,lastname,email,department
-12345678,EMP001,John,Smith,john@example.com,Engineering
-87654321,EMP002,Jane,Doe,jane@example.com,Marketing
+card_id,user_id,facility,firstname,lastname,doors,active,email,department
+a1b2c3d4,EMP001,123,John,Smith,front-door,1,john@example.com,Engineering
+b2c3d4e5,EMP002,123,Jane,Doe,front-door,1,jane@example.com,Marketing
 ```
 
-Upload at **Cards** > **Import CSV**. Optional columns: `email`, `phone`, `department`, `employee_id`, `company`, `title`, `notes`, `group_id`, `schedule_id`, `valid_from`, `valid_until`, `pin_code`.
+Upload at **Cards** > **Import CSV**. Required: `card_id`, `user_id`. Needed to grant access: `facility` (must match the reader) and `doors` (comma-separated door names, or `*`). If `doors` is empty and `group_id` is set (or a default group is chosen), that group's doors are copied onto the card. Optional: `firstname`, `lastname`, `active`, `email`, `phone`, `department`, `employee_id`, `company`, `title`, `notes`, `group_id`, `schedule_id`, `valid_from`, `valid_until`, `daily_scan_limit`, `master`. Keypad PIN is `card_id`; a `pin_code` column is ignored. Export CSV uses the same columns so a round-trip re-import keeps door access and active status.
 
 ### Creating Access Schedules
 
