@@ -278,6 +278,33 @@ function DoorFormModal({
             )}
           </div>
         )}
+        {cfg.enabled && section === 'outputs' && name === 'open' && (
+          <div className="mt-2">
+            <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400">
+              <input
+                type="checkbox"
+                checked={!!cfg.soft_cycle}
+                onChange={(e) => updateGateIO(section, name, { soft_cycle: e.target.checked })}
+                className="rounded border-slate-300"
+              />
+              Soft Open Cycle
+              <span className="font-normal text-slate-500">(gate opener runs its own open/close timing)</span>
+            </label>
+            {cfg.soft_cycle && (
+              <div className="mt-2">
+                <label className="label text-xs">Open Cycle Duration (sec)</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={600}
+                  className="input"
+                  value={cfg.soft_cycle_seconds ?? 30}
+                  onChange={(e) => updateGateIO(section, name, { soft_cycle_seconds: parseInt(e.target.value) || 30 })}
+                />
+              </div>
+            )}
+          </div>
+        )}
       </div>
     );
   };
@@ -317,6 +344,33 @@ function DoorFormModal({
               <div>
                 <label className="label text-xs">Hold (sec)</label>
                 <input type="number" min={1} max={300} className="input" value={cfg.duration_seconds ?? 30} onChange={(e) => updateDoubleGateIO(section, lane, action, { duration_seconds: parseInt(e.target.value) || 30 })} />
+              </div>
+            )}
+          </div>
+        )}
+        {cfg.enabled && section === 'outputs' && action === 'open' && (
+          <div className="mt-2">
+            <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400">
+              <input
+                type="checkbox"
+                checked={!!cfg.soft_cycle}
+                onChange={(e) => updateDoubleGateIO(section, lane, action, { soft_cycle: e.target.checked })}
+                className="rounded border-slate-300"
+              />
+              Soft Open Cycle
+              <span className="font-normal text-slate-500">(gate opener runs its own open/close timing)</span>
+            </label>
+            {cfg.soft_cycle && (
+              <div className="mt-2">
+                <label className="label text-xs">Open Cycle Duration (sec)</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={600}
+                  className="input"
+                  value={cfg.soft_cycle_seconds ?? 30}
+                  onChange={(e) => updateDoubleGateIO(section, lane, action, { soft_cycle_seconds: parseInt(e.target.value) || 30 })}
+                />
               </div>
             )}
           </div>

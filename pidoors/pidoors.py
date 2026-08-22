@@ -1363,18 +1363,30 @@ def _gate_run_output(name, transient_state):
             gate_outbound_state = transient_state
     debug(f"Gate output '{name}' active for {duration}s")
 
-    # Wait for duration OR stop event
-    interrupted = gate_stop_event.wait(timeout=duration)
+    # Wait for duration OR stop event. Capture the event object so a later
+    # soft-open-cycle wait keeps responding to stop even after gate_command
+    # replaces the global gate_stop_event with a fresh one.
+    stop_event = gate_stop_event
+    interrupted = stop_event.wait(timeout=duration)
     if interrupted:
         debug(f"Gate output '{name}' interrupted by stop")
     _gate_set_output(name, False)
+    lane = name.split('.', 1)[0] if '.' in name else None
+    action = name.split('.', 1)[1] if '.' in name else name
+
+    # Soft open cycle: the gate opener runs its own open->close timing after
+    # the trigger pulse, so report that timing instead of settling on 'open'.
+    entry = _gate_output_config(name)
+    if action == 'open' and not interrupted and entry.get('soft_cycle'):
+        cycle_seconds = max(1.0, float(entry.get('soft_cycle_seconds', 30)))
+        _run_soft_open_cycle(lane, cycle_seconds, stop_event)
+        return
+
     with gate_lock:
         if gate_active_output == name:
             gate_active_output = None
     # Settle final state + reset legacy LEDs back to idle (red)
     _set_legacy_leds(False)
-    lane = name.split('.', 1)[0] if '.' in name else None
-    action = name.split('.', 1)[1] if '.' in name else name
     final_state = 'stopped' if interrupted else ('open' if action == 'open' else 'closed' if action == 'close' else 'stopped')
     if lane == 'inbound':
         gate_inbound_state = final_state
@@ -1389,6 +1401,31 @@ def _gate_run_output(name, transient_state):
         gate_set_state(final_state)
     else:
         gate_set_state('stopped')
+
+
+def _run_soft_open_cycle(lane, cycle_seconds, stop_event):
+    """Report opening/closing timing for a gate-opener-driven cycle; no GPIO is touched here."""
+    global gate_active_output, gate_inbound_state, gate_outbound_state
+    half = cycle_seconds / 2.0
+
+    interrupted = stop_event.wait(timeout=half)
+    if not interrupted:
+        gate_set_state('closing')
+        if lane == 'inbound':
+            gate_inbound_state = 'closing'
+        elif lane == 'outbound':
+            gate_outbound_state = 'closing'
+        interrupted = stop_event.wait(timeout=half)
+
+    with gate_lock:
+        gate_active_output = None
+    _set_legacy_leds(False)
+    final_state = 'stopped' if interrupted else 'closed'
+    if lane == 'inbound':
+        gate_inbound_state = final_state
+    elif lane == 'outbound':
+        gate_outbound_state = final_state
+    gate_set_state(final_state)
 
 
 def _gate_run_double_hold_open():

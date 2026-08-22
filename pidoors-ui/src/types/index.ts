@@ -68,6 +68,9 @@ export interface GateIO {
   active_means_clear?: boolean;
   pull?: 'up' | 'down' | 'none';
   debounce_ms?: number;
+  // Open relay only: gate opener runs its own open/close timing after the trigger pulse.
+  soft_cycle?: boolean;
+  soft_cycle_seconds?: number;
 }
 
 export interface GateAutoClose {
