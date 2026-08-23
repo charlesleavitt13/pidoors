@@ -36,6 +36,7 @@ function CardFormModal({
 }) {
   const isEdit = card && card.card_id;
   const [form, setForm] = useState<Partial<Card> & { master_card?: number }>({
+    card_id: '',
     user_id: '',
     facility: '',
     firstname: '',
@@ -75,9 +76,15 @@ function CardFormModal({
         <form onSubmit={(e) => { e.preventDefault(); onSave(form); }} className="space-y-4">
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="label">Card Number *</label>
-              <input className="input" value={form.user_id || ''} onChange={(e) => set('user_id', e.target.value)} required disabled={!!isEdit} />
+              <label className="label">Card ID / PIN *</label>
+              <input className="input" value={form.card_id || ''} onChange={(e) => set('card_id', e.target.value)} required />
             </div>
+            <div>
+              <label className="label">User ID *</label>
+              <input className="input" value={form.user_id || ''} onChange={(e) => set('user_id', e.target.value)} required />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="label">Facility Code</label>
               <input className="input" value={form.facility || ''} onChange={(e) => set('facility', e.target.value)} />
@@ -288,7 +295,8 @@ export function CardsPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-slate-200 dark:border-slate-700">
-                <th className="px-4 py-3 text-left font-medium text-slate-500 dark:text-slate-400">Card #</th>
+                <th className="px-4 py-3 text-left font-medium text-slate-500 dark:text-slate-400">Card ID / PIN</th>
+                <th className="px-4 py-3 text-left font-medium text-slate-500 dark:text-slate-400">User ID</th>
                 <th className="px-4 py-3 text-left font-medium text-slate-500 dark:text-slate-400">Name</th>
                 <th className="px-4 py-3 text-left font-medium text-slate-500 dark:text-slate-400 hidden md:table-cell">Department</th>
                 <th className="px-4 py-3 text-left font-medium text-slate-500 dark:text-slate-400 hidden lg:table-cell">Doors</th>
@@ -299,13 +307,14 @@ export function CardsPage() {
             <tbody>
               {paginated.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-slate-500">
+                  <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
                     {search ? 'No cards match your search' : 'No cards yet'}
                   </td>
                 </tr>
               ) : (
                 paginated.map((card) => (
                   <tr key={card.card_id} className="border-b border-slate-100 dark:border-slate-700/50 hover:bg-slate-50 dark:hover:bg-slate-700/30">
+                    <td className="px-4 py-3 font-mono text-slate-900 dark:text-white">{card.card_id || '-'}</td>
                     <td className="px-4 py-3 font-mono text-slate-900 dark:text-white">{card.user_id}</td>
                     <td className="px-4 py-3 text-slate-900 dark:text-white">
                       {card.firstname} {card.lastname}
