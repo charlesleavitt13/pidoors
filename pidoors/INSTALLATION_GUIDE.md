@@ -388,6 +388,26 @@ Connect your electric lock to the relay's NO (Normally Open) and COM terminals w
 }
 ```
 
+#### Diagnosing an undocumented Wiegand keypad
+
+PiDoors does not authorize keypad PINs until the reader's keypress protocol is identified. To capture the Retekess T-AC04's key frames, add these settings inside the door's configuration block:
+
+```json
+"keypad_diagnostic_capture": true,
+"keypad_diagnostic_capture_seconds": 300
+```
+
+Restart the controller, then press `0` through `9`, `*`, and `#` one key at a time with a short pause between each press:
+
+```bash
+sudo systemctl restart pidoors
+sudo journalctl -u pidoors -f
+```
+
+The journal will show the unsupported frame length and raw bits for each press. Raw frames can reveal entered digits, so run this only during a controlled test, do not enter real PINs, and set `keypad_diagnostic_capture` back to `false` when finished. This diagnostic mode does not unlock doors or attempt PIN validation.
+
+When keypad PIN access is enabled, enter up to four digits and press `#` to submit. The `*` key is ignored so it remains available for reader-specific keypad modes. The entered value is matched against the cardholder's existing **Card ID / PIN** field, so no separate PIN field is required. PIN attempts are recorded only in access logging; PiDoors never records the literal PIN.
+
 ---
 
 ### OSDP RS-485 Readers

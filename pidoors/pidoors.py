@@ -39,6 +39,8 @@ import fcntl
 import subprocess
 import hmac
 import tempfile
+import urllib.error
+import urllib.request
 
 # Try to import optional dependencies
 try:
@@ -814,6 +816,18 @@ def setup_readers():
             reader["timer"] = None
             reader["name"] = name
             reader["unlocked"] = False
+            reader["keypad_diagnostic_count"] = 0
+            reader["keypad_diagnostic_expires_at"] = 0
+            reader["keypad_pin"] = ""
+            reader["keypad_pin_updated_at"] = 0
+
+            if reader.get("keypad_diagnostic_capture"):
+                try:
+                    duration = min(max(int(reader.get("keypad_diagnostic_capture_seconds", 300)), 1), 300)
+                except (TypeError, ValueError):
+                    duration = 300
+                reader["keypad_diagnostic_expires_at"] = time.monotonic() + duration
+                report(f"{name}: keypad diagnostic capture enabled for {duration} seconds; raw frames can reveal entered digits")
 
             zone_by_pin[reader["d0"]] = name
             zone_by_pin[reader["d1"]] = name
@@ -1585,10 +1599,178 @@ def wiegand_stream_done(reader):
         reader["timer"] = None
 
     # Process outside the lock
-    validate_bits(bitstring)
+    validate_bits(bitstring, reader)
 
 
-def validate_bits(bstr):
+def _capture_keypad_diagnostic(reader, bitstring):
+    """Log an unsupported Wiegand frame during an explicitly enabled capture window."""
+    expires_at = reader.get("keypad_diagnostic_expires_at", 0)
+    if not expires_at:
+        return
+
+    if time.monotonic() >= expires_at:
+        reader["keypad_diagnostic_expires_at"] = 0
+        report(f"{reader.get('name', 'Wiegand reader')}: keypad diagnostic capture expired")
+        return
+
+    reader["keypad_diagnostic_count"] = reader.get("keypad_diagnostic_count", 0) + 1
+    report(
+        f"{reader.get('name', 'Wiegand reader')}: keypad diagnostic frame "
+        f"#{reader['keypad_diagnostic_count']} bits={len(bitstring)} raw={bitstring}"
+    )
+
+
+def _submit_keypad_pin(reader, pin):
+    """Authorize a completed keypad PIN online."""
+    global db_connected, last_db_attempt
+
+    if door_is_locked_down():
+        reject_card(pin, "Door is in lockdown")
+        log_access(None, pin, "", False, "Lockdown mode active")
+        return
+
+    if not MYSQL_AVAILABLE:
+        reject_card(pin, "PIN access unavailable")
+        log_access(None, pin, "", False, "PIN access unavailable")
+        return
+
+    now = datetime.now()
+    db = None
+    try:
+        with state_lock:
+            if not db_connected and (time.time() - last_db_attempt) < DB_RETRY_INTERVAL:
+                raise RuntimeError("Database reconnect rate limited")
+            last_db_attempt = time.time()
+
+        db = get_db_connection(timeout=5)
+        if db is None:
+            raise RuntimeError("Database unavailable")
+
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        with state_lock:
+            db_connected = True
+
+        # The Card ID / PIN value must be unique. Refuse ambiguous matches
+        # rather than granting access to an arbitrary cardholder.
+        cursor.execute("SELECT * FROM cards WHERE card_id = %s LIMIT 2", (pin,))
+        cards = cursor.fetchall()
+        if len(cards) != 1:
+            reject_card(pin, "Invalid PIN")
+            cursor.execute("""
+                INSERT INTO logs (user_id, Date, Granted, Location, doorip)
+                VALUES (%s, %s, 0, %s, %s)
+            """, (pin, now, zone, myip))
+            db.commit()
+            log_access(None, pin, "", False, "Invalid PIN")
+            return
+
+        card = cards[0]
+        user_id = card['user_id']
+        card_doors = card.get('doors', '')
+        card_door_list = [door.strip() for door in card_doors.split(',') if door.strip()]
+        granted = False
+        reason = ""
+
+        if card['active'] != 1:
+            reason = "Credential inactive"
+        elif not (zone in card_door_list or card_doors == '*'):
+            reason = "No access to this door"
+        elif card.get('valid_from') and now.date() < card['valid_from']:
+            reason = "Credential not yet valid"
+        elif card.get('valid_until') and now.date() > card['valid_until']:
+            reason = "Credential expired"
+        elif card.get('schedule_id') and not check_schedule_from_db(cursor, card['schedule_id'], now):
+            reason = "Outside scheduled hours"
+        elif is_holiday_denied_db(cursor, now):
+            reason = "Access denied on holiday"
+        elif card.get('daily_scan_limit') and int(card['daily_scan_limit']) > 0:
+            cursor.execute("""
+                SELECT COUNT(*) as cnt FROM logs
+                WHERE user_id = %s AND Location = %s
+                  AND DATE(Date) = CURDATE() AND Granted = 1
+            """, (user_id, zone))
+            count_row = cursor.fetchone()
+            today_count = int(count_row['cnt']) if count_row else 0
+            if today_count >= int(card['daily_scan_limit']):
+                reason = "Daily scan limit reached"
+            else:
+                granted = True
+        else:
+            granted = True
+
+        if granted:
+            name = f"{card.get('firstname', '')} {card.get('lastname', '')}".strip() or user_id
+            open_door(user_id, name)
+            reason = "PIN access granted"
+        else:
+            reject_card(user_id, reason)
+
+        cursor.execute("""
+            INSERT INTO logs (user_id, Date, Granted, Location, doorip)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (user_id, now, 1 if granted else 0, zone, myip))
+        db.commit()
+        log_access(user_id, pin, "", granted, reason)
+    except Exception as e:
+        with state_lock:
+            db_connected = False
+        debug(f"PIN access check failed: {e}")
+        reject_card(pin, "PIN access unavailable")
+        log_access(None, pin, "", False, "PIN access unavailable")
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _handle_keypad_frame(reader, bitstring):
+    """Handle four-bit per-key Wiegand keypad output."""
+    if not reader.get("keypad_enabled") or len(bitstring) != 4:
+        return False
+
+    key_code = int(bitstring, 2)
+    now = time.monotonic()
+    try:
+        timeout = max(float(reader.get("keypad_pin_timeout_seconds", 15)), 1)
+    except (TypeError, ValueError):
+        timeout = 15
+
+    max_length = 4
+
+    if now - reader.get("keypad_pin_updated_at", 0) > timeout:
+        reader["keypad_pin"] = ""
+
+    if 0 <= key_code <= 9:
+        if len(reader["keypad_pin"]) < max_length:
+            reader["keypad_pin"] += str(key_code)
+            reader["keypad_pin_updated_at"] = now
+        else:
+            reader["keypad_pin"] = ""
+            reader["keypad_pin_updated_at"] = now
+            reject_card(reader["keypad_pin"], "PIN entry too long")
+            log_access(None, reader["keypad_pin"], "", False, "PIN entry too long")
+        return True
+
+    if key_code == 10:  # * is reserved by other keypad modes.
+        return True
+
+    if key_code == 11:  # # submits the buffered PIN.
+        pin = reader["keypad_pin"]
+        reader["keypad_pin"] = ""
+        reader["keypad_pin_updated_at"] = now
+        if pin:
+            _submit_keypad_pin(reader, pin)
+        else:
+            reject_card(pin, "Invalid PIN")
+            log_access(None, pin, "", False, "Invalid PIN")
+        return True
+
+    return False
+
+
+def validate_bits(bstr, reader=None):
     """Validate Wiegand bit stream and extract card data using format registry"""
     bit_len = len(bstr)
 
@@ -1607,6 +1789,10 @@ def validate_bits(bstr):
             return False
         else:
             debug(f"Unsupported Wiegand format: {bit_len} bits")
+            if reader is not None and _handle_keypad_frame(reader, bstr):
+                return False
+            if reader is not None:
+                _capture_keypad_diagnostic(reader, bstr)
             return False
 
     # Legacy fallback: Support 26-bit and 34-bit only
@@ -1616,6 +1802,10 @@ def validate_bits(bstr):
         return validate_34bit_legacy(bstr)
     else:
         debug(f"Unsupported Wiegand format: {bit_len} bits (use format registry for more formats)")
+        if reader is not None and _handle_keypad_frame(reader, bstr):
+            return False
+        if reader is not None:
+            _capture_keypad_diagnostic(reader, bstr)
         return False
 
 

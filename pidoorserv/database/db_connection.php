@@ -38,3 +38,14 @@ try {
     error_log("Database connection failed: " . $e->getMessage());
     die("Database connection failed. Please contact the administrator.");
 }
+
+// Site timezone is authoritative in the DB (Settings page); config.php is only a pre-migration fallback.
+// Log timestamps are written by door controllers using their local clock, so no zone conversion is applied anywhere else.
+$site_timezone = $config['timezone'] ?? 'UTC';
+try {
+    $tz_row = $pdo_access->query("SELECT setting_value FROM settings WHERE setting_key = 'timezone'")->fetch();
+    if ($tz_row && !empty($tz_row['setting_value'])) {
+        $site_timezone = $tz_row['setting_value'];
+    }
+} catch (Exception $e) {}
+date_default_timezone_set($site_timezone);

@@ -10,6 +10,13 @@
         "d1": 23,
         "wiegand_format": "auto",
 
+        "_keypad_diagnostic": "Set keypad_diagnostic_capture to true only for a controlled five-minute protocol capture. Raw frames can reveal entered digits; disable it immediately after collecting results.",
+        "keypad_diagnostic_capture": false,
+        "keypad_diagnostic_capture_seconds": 300,
+        "_keypad_pin": "T-AC04 keypad: four digits maximum; 0-9 enters digits, * is ignored, and # submits. The entered value is matched to the existing Card ID / PIN field and is recorded only as an access attempt.",
+        "keypad_enabled": false,
+        "keypad_pin_timeout_seconds": 15,
+
         "_door_settings": "--- Door Control ---",
         "latch_gpio": 18,
         "unlock_value": 1,
