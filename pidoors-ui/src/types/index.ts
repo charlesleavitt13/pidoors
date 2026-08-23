@@ -31,6 +31,7 @@ export interface Door {
   description: string;
   ip_address: string;
   schedule_id: number | null;
+  hold_open_schedule_id: number | null;
   unlock_duration: number;
   status: 'online' | 'offline' | 'unknown';
   last_seen: string | null;
@@ -51,6 +52,8 @@ export interface Door {
   door_sensor_invert: number;
   is_gate: number;
   gate_state: 'idle' | 'opening' | 'closing' | 'stopped' | 'open' | 'closed';
+  gate_inbound_state?: 'idle' | 'opening' | 'closing' | 'stopped' | 'open' | 'closed';
+  gate_outbound_state?: 'idle' | 'opening' | 'closing' | 'stopped' | 'open' | 'closed';
   gate_held: number;
   gate_config: GateConfig | null;
   status_led_config: StatusLedConfig | null;
@@ -65,6 +68,9 @@ export interface GateIO {
   active_means_clear?: boolean;
   pull?: 'up' | 'down' | 'none';
   debounce_ms?: number;
+  // Open relay only: gate opener runs its own open/close timing after the trigger pulse.
+  soft_cycle?: boolean;
+  soft_cycle_seconds?: number;
 }
 
 export interface GateAutoClose {
@@ -73,16 +79,21 @@ export interface GateAutoClose {
 }
 
 export interface GateConfig {
+  double_gate?: boolean;
   inputs?: {
     open?: GateIO;
     stop?: GateIO;
     close?: GateIO;
     clearance?: GateIO;
+    inbound?: GateLaneIO;
+    outbound?: GateLaneIO;
   };
   outputs?: {
     open?: GateIO;
     stop?: GateIO;
     close?: GateIO;
+    inbound?: GateLaneIO;
+    outbound?: GateLaneIO;
   };
   auto_close?: GateAutoClose;
   advanced?: {
@@ -90,6 +101,12 @@ export interface GateConfig {
     triple_tap_window_ms?: number;
     pull?: 'up' | 'down' | 'none';
   };
+}
+
+export interface GateLaneIO {
+  open?: GateIO;
+  stop?: GateIO;
+  close?: GateIO;
 }
 
 export interface StatusLedConfig {

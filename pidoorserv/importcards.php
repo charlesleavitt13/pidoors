@@ -15,11 +15,53 @@ $import_results = [];
 
 // Get groups and schedules for mapping
 try {
-    $groups = $pdo_access->query("SELECT id, name FROM access_groups ORDER BY name")->fetchAll();
+    $groups = $pdo_access->query("SELECT id, name, doors FROM access_groups ORDER BY name")->fetchAll();
     $schedules = $pdo_access->query("SELECT id, name FROM access_schedules ORDER BY name")->fetchAll();
 } catch (PDOException $e) {
     $groups = [];
     $schedules = [];
+}
+
+$valid_groups = [];
+$group_doors_map = [];
+foreach ($groups as $g) {
+    $gid = (int)$g['id'];
+    $valid_groups[$gid] = true;
+    $group_doors_map[$gid] = $g['doors'] ?? '';
+}
+$valid_schedules = [];
+foreach ($schedules as $s) {
+    $valid_schedules[(int)$s['id']] = true;
+}
+
+function import_copy_group_doors(string $doors, ?int $group_id, array $group_doors_map): string {
+    $doors = trim($doors);
+    if ($doors !== '') {
+        return $doors;
+    }
+    if ($group_id === null || !isset($group_doors_map[$group_id])) {
+        return '';
+    }
+    $decoded = json_decode((string)$group_doors_map[$group_id], true);
+    if (!is_array($decoded) || $decoded === []) {
+        return '';
+    }
+    $names = [];
+    foreach ($decoded as $name) {
+        $name = trim((string)$name);
+        if ($name !== '') {
+            $names[] = $name;
+        }
+    }
+    return implode(',', $names);
+}
+
+function import_parse_active($value): int {
+    $v = strtolower(trim((string)$value));
+    if ($v === '0' || $v === 'no' || $v === 'false' || $v === 'inactive') {
+        return 0;
+    }
+    return 1;
 }
 
 // Handle file upload
@@ -46,13 +88,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     if (!$header) {
                         $error_message = 'CSV file is empty or invalid.';
                     } else {
-                        // Normalize headers
+                        // Normalize headers (strip Excel UTF-8 BOM)
+                        if (isset($header[0])) {
+                            $header[0] = preg_replace('/^\xEF\xBB\xBF/', '', (string)$header[0]);
+                        }
                         $header = array_map('strtolower', array_map('trim', $header));
 
                         // Map columns
                         $col_map = [];
                         $required_cols = ['card_id', 'user_id'];
-                        $optional_cols = ['facility', 'firstname', 'lastname', 'email', 'phone', 'department', 'employee_id', 'company', 'title', 'notes', 'group_id', 'schedule_id', 'valid_from', 'valid_until', 'pin_code', 'daily_scan_limit', 'master'];
+                        $optional_cols = ['facility', 'firstname', 'lastname', 'doors', 'active', 'email', 'phone', 'department', 'employee_id', 'company', 'title', 'notes', 'group_id', 'schedule_id', 'valid_from', 'valid_until', 'daily_scan_limit', 'master'];
 
                         foreach ($required_cols as $col) {
                             $idx = array_search($col, $header);
@@ -75,26 +120,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                             $default_schedule = validate_int($_POST['default_schedule'] ?? 0) ?: null;
                             $skip_duplicates = isset($_POST['skip_duplicates']);
 
+                            if ($default_group !== null && !isset($valid_groups[$default_group])) {
+                                $error_message = "Unknown default group.";
+                            } elseif ($default_schedule !== null && !isset($valid_schedules[$default_schedule])) {
+                                $error_message = "Unknown default schedule.";
+                            }
+
                             $imported = 0;
                             $skipped = 0;
                             $errors = 0;
                             $line_num = 1;
+                            $header_count = count($header);
 
+                            if (!$error_message) {
                             $pdo_access->beginTransaction();
 
                             try {
                                 $insert_stmt = $pdo_access->prepare("
-                                    INSERT INTO cards (card_id, user_id, facility, firstname, lastname, email, phone, department, employee_id, company, title, notes, group_id, schedule_id, valid_from, valid_until, pin_code, daily_scan_limit)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    INSERT INTO cards (card_id, user_id, facility, firstname, lastname, doors, active, email, phone, department, employee_id, company, title, notes, group_id, schedule_id, valid_from, valid_until, daily_scan_limit)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 ");
+                                $dup_stmt = $pdo_access->prepare("SELECT id FROM cards WHERE card_id = ? OR user_id = ?");
 
                                 while (($row = fgetcsv($handle)) !== false) {
                                     $line_num++;
 
-                                    if (count($row) < count($required_cols)) {
-                                        $import_results[] = "Line {$line_num}: Skipped - insufficient columns";
-                                        $skipped++;
+                                    if ($row === [null] || (count($row) === 1 && trim((string)$row[0]) === '')) {
                                         continue;
+                                    }
+                                    if (count($row) < $header_count) {
+                                        $row = array_pad($row, $header_count, '');
                                     }
 
                                     $card_id = sanitize_string($row[$col_map['card_id']] ?? '');
@@ -106,11 +161,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                                         continue;
                                     }
 
-                                    // Check for duplicate
                                     if ($skip_duplicates) {
-                                        $check = $pdo_access->prepare("SELECT id FROM cards WHERE card_id = ? OR user_id = ?");
-                                        $check->execute([$card_id, $user_id]);
-                                        if ($check->fetch()) {
+                                        $dup_stmt->execute([$card_id, $user_id]);
+                                        if ($dup_stmt->fetch()) {
                                             $import_results[] = "Line {$line_num}: Skipped - duplicate card_id or user_id";
                                             $skipped++;
                                             continue;
@@ -129,19 +182,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                                     $csv_notes = sanitize_string($row[$col_map['notes'] ?? -1] ?? '') ?: null;
                                     $group_id = validate_int($row[$col_map['group_id'] ?? -1] ?? 0) ?: $default_group;
                                     $schedule_id = validate_int($row[$col_map['schedule_id'] ?? -1] ?? 0) ?: $default_schedule;
+                                    if ($group_id !== null && !isset($valid_groups[$group_id])) {
+                                        $import_results[] = "Line {$line_num}: Skipped - unknown group_id {$group_id}";
+                                        $skipped++;
+                                        continue;
+                                    }
+                                    if ($schedule_id !== null && !isset($valid_schedules[$schedule_id])) {
+                                        $import_results[] = "Line {$line_num}: Skipped - unknown schedule_id {$schedule_id}";
+                                        $skipped++;
+                                        continue;
+                                    }
+                                    $csv_doors = import_copy_group_doors(
+                                        sanitize_string($row[$col_map['doors'] ?? -1] ?? ''),
+                                        $group_id,
+                                        $group_doors_map
+                                    );
+                                    $csv_active = import_parse_active($row[$col_map['active'] ?? -1] ?? '1');
                                     $valid_from = sanitize_string($row[$col_map['valid_from'] ?? -1] ?? '') ?: null;
                                     $valid_until = sanitize_string($row[$col_map['valid_until'] ?? -1] ?? '') ?: null;
-                                    $pin_code = sanitize_string($row[$col_map['pin_code'] ?? -1] ?? '') ?: null;
                                     $csv_daily_scan_limit = isset($col_map['daily_scan_limit']) ? (validate_int($row[$col_map['daily_scan_limit']] ?? '', 0, 999) ?: null) : null;
                                     $csv_master = strtolower(trim($row[$col_map['master'] ?? -1] ?? ''));
                                     $is_master = in_array($csv_master, ['1', 'yes', 'true'], true);
 
+                                    if ($csv_facility === '') {
+                                        $import_results[] = "Line {$line_num}: Warning - no facility; a scan may not match this card";
+                                    }
+                                    if ($csv_doors === '') {
+                                        $import_results[] = "Line {$line_num}: Warning - no doors assigned; this card cannot open any door";
+                                    }
+
                                     try {
                                         $insert_stmt->execute([
                                             $card_id, $user_id, $csv_facility, $firstname, $lastname,
+                                            $csv_doors, $csv_active,
                                             $csv_email, $csv_phone, $csv_department, $csv_employee_id,
                                             $csv_company, $csv_title, $csv_notes,
-                                            $group_id, $schedule_id, $valid_from, $valid_until, $pin_code,
+                                            $group_id, $schedule_id, $valid_from, $valid_until,
                                             $csv_daily_scan_limit
                                         ]);
 
@@ -171,6 +247,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                             } catch (Exception $e) {
                                 $pdo_access->rollBack();
                                 $error_message = 'Import failed: ' . $e->getMessage();
+                            }
                             }
                         }
                     }
@@ -264,15 +341,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
             <div class="card-body">
                 <p class="small"><strong>Required columns:</strong></p>
                 <ul class="small">
-                    <li><code>card_id</code> - The card number (Wiegand format)</li>
+                    <li><code>card_id</code> - Wiegand card ID (also used as keypad PIN)</li>
                     <li><code>user_id</code> - Unique user identifier</li>
+                </ul>
+
+                <p class="small"><strong>Needed to grant access:</strong></p>
+                <ul class="small">
+                    <li><code>facility</code> - Must match the reader facility code</li>
+                    <li><code>doors</code> - Comma-separated door names, or <code>*</code> for all. If empty and a group is assigned, that group's doors are copied.</li>
                 </ul>
 
                 <p class="small"><strong>Optional columns:</strong></p>
                 <ul class="small">
-                    <li><code>facility</code> - Facility code (needed for card verification)</li>
                     <li><code>firstname</code> - First name</li>
                     <li><code>lastname</code> - Last name</li>
+                    <li><code>active</code> - 1/0 (default 1)</li>
                     <li><code>email</code> - Email address</li>
                     <li><code>phone</code> - Phone number</li>
                     <li><code>department</code> - Department</li>
@@ -284,10 +367,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     <li><code>schedule_id</code> - Schedule ID</li>
                     <li><code>valid_from</code> - Start date (YYYY-MM-DD)</li>
                     <li><code>valid_until</code> - End date (YYYY-MM-DD)</li>
-                    <li><code>pin_code</code> - Optional PIN</li>
                     <li><code>daily_scan_limit</code> - Max scans per day (0 = unlimited)</li>
                     <li><code>master</code> - Master card (1/yes/true)</li>
                 </ul>
+                <p class="small text-muted mb-0">Keypad PIN is <code>card_id</code>. A <code>pin_code</code> column is ignored.</p>
             </div>
         </div>
 
@@ -296,11 +379,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                 <h6 class="mb-0">Sample CSV</h6>
             </div>
             <div class="card-body">
-                <pre class="small bg-light p-2 mb-0">card_id,user_id,firstname,lastname
-12345678,U001,John,Smith
-23456789,U002,Jane,Doe
-34567890,U003,Bob,Wilson</pre>
-                <a href="data:text/csv;charset=utf-8,card_id,user_id,firstname,lastname%0A12345678,U001,John,Smith%0A23456789,U002,Jane,Doe"
+                <pre class="small bg-light p-2 mb-0">card_id,user_id,facility,firstname,lastname,doors,active
+a1b2c3d4,U001,123,John,Smith,front-door,1
+b2c3d4e5,U002,123,Jane,Doe,front-door,1</pre>
+                <a href="data:text/csv;charset=utf-8,card_id,user_id,facility,firstname,lastname,doors,active%0Aa1b2c3d4,U001,123,John,Smith,front-door,1%0Ab2c3d4e5,U002,123,Jane,Doe,front-door,1"
                    download="sample_cards.csv" class="btn btn-sm btn-outline-secondary mt-2">Download Sample</a>
             </div>
         </div>

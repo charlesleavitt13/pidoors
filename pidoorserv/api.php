@@ -166,6 +166,45 @@ function require_csrf() {
     }
 }
 
+function csv_normalize_headers(array $header): array {
+    if (isset($header[0])) {
+        $header[0] = preg_replace('/^\xEF\xBB\xBF/', '', (string)$header[0]);
+    }
+    return array_map(function ($h) {
+        return strtolower(trim((string)$h));
+    }, $header);
+}
+
+function csv_copy_group_doors(string $doors, ?int $group_id, array $group_doors_map): string {
+    $doors = trim($doors);
+    if ($doors !== '') {
+        return $doors;
+    }
+    if ($group_id === null || !isset($group_doors_map[$group_id])) {
+        return '';
+    }
+    $decoded = json_decode((string)$group_doors_map[$group_id], true);
+    if (!is_array($decoded) || $decoded === []) {
+        return '';
+    }
+    $names = [];
+    foreach ($decoded as $name) {
+        $name = trim((string)$name);
+        if ($name !== '') {
+            $names[] = $name;
+        }
+    }
+    return implode(',', $names);
+}
+
+function csv_parse_active($value): int {
+    $v = strtolower(trim((string)$value));
+    if ($v === '0' || $v === 'no' || $v === 'false' || $v === 'inactive') {
+        return 0;
+    }
+    return 1;
+}
+
 // ──────────────────────────────────────────────
 // GPIO pin reservation helpers (gate/LED config)
 // ──────────────────────────────────────────────
@@ -235,7 +274,10 @@ function validate_gate_pins(PDO $pdo, string $door_name, array $cfg, array $inpu
     $reserved = get_reserved_pins($door, $input);
     $used = [];
 
-    $sections = ['inputs' => ['open', 'stop', 'close', 'clearance'], 'outputs' => ['open', 'stop', 'close']];
+    $sections = [
+        'inputs' => ['open', 'stop', 'close', 'clearance'],
+        'outputs' => ['open', 'stop', 'close'],
+    ];
     foreach ($sections as $section => $names) {
         foreach ($names as $name) {
             $entry = $cfg[$section][$name] ?? null;
@@ -247,6 +289,24 @@ function validate_gate_pins(PDO $pdo, string $door_name, array $cfg, array $inpu
             if (isset($reserved[$pin])) return "GPIO $pin is already used by {$reserved[$pin]} (gate $section.$name)";
             if (isset($used[$pin])) return "GPIO $pin assigned to multiple gate features ({$used[$pin]} and $section.$name)";
             $used[$pin] = "$section.$name";
+        }
+    }
+    if (!empty($cfg['double_gate'])) {
+        foreach (['inputs', 'outputs'] as $section) {
+            foreach (['inbound', 'outbound'] as $lane) {
+                foreach (['open', 'stop', 'close'] as $name) {
+                    $entry = $cfg[$section][$lane][$name] ?? null;
+                    if (!$entry || empty($entry['enabled'])) continue;
+                    $pin = $entry['pin'] ?? null;
+                    if ($pin === null || $pin === '') continue;
+                    $pin = (int)$pin;
+                    $label = "$section.$lane.$name";
+                    if ($pin <= 0 || $pin > 27) return "Invalid pin number for gate $label: $pin";
+                    if (isset($reserved[$pin])) return "GPIO $pin is already used by {$reserved[$pin]} (gate $label)";
+                    if (isset($used[$pin])) return "GPIO $pin assigned to multiple gate features ({$used[$pin]} and $label)";
+                    $used[$pin] = $label;
+                }
+            }
         }
     }
 
@@ -314,6 +374,16 @@ function validate_status_led_pin(PDO $pdo, string $door_name, array $cfg, array 
                 $entry = $gate_cfg[$section][$name] ?? null;
                 if ($entry && !empty($entry['enabled']) && (int)($entry['pin'] ?? 0) === $pin) {
                     return "GPIO $pin is already used by gate $section.$name";
+                }
+            }
+        }
+        foreach (['inputs', 'outputs'] as $section) {
+            foreach (['inbound', 'outbound'] as $lane) {
+                foreach (['open', 'stop', 'close'] as $name) {
+                    $entry = $gate_cfg[$section][$lane][$name] ?? null;
+                    if ($entry && !empty($entry['enabled']) && (int)($entry['pin'] ?? 0) === $pin) {
+                        return "GPIO $pin is already used by gate $section.$lane.$name";
+                    }
                 }
             }
         }
@@ -478,7 +548,7 @@ if ($resource === 'dashboard' && $method === 'GET') {
         $today_granted = (int)$pdo_access->query("SELECT COUNT(*) FROM logs WHERE DATE(Date) = CURDATE() AND Granted = 1")->fetchColumn();
         $today_denied = (int)$pdo_access->query("SELECT COUNT(*) FROM logs WHERE DATE(Date) = CURDATE() AND Granted = 0")->fetchColumn();
 
-        $doors = $pdo_access->query("SELECT name, location, status, locked, held_open, hold_requested, unlock_requested, push_available, door_sensor_gpio, door_open, door_sensor_invert, is_gate, gate_state, gate_held FROM doors ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
+        $doors = $pdo_access->query("SELECT name, location, status, locked, held_open, hold_requested, unlock_requested, push_available, door_sensor_gpio, door_open, door_sensor_invert, is_gate, gate_state, gate_inbound_state, gate_outbound_state, gate_held, gate_config, hold_open_schedule_id FROM doors ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
         // Cast numeric fields
         foreach ($doors as &$d) {
             $d['locked'] = (int)$d['locked'];
@@ -491,7 +561,11 @@ if ($resource === 'dashboard' && $method === 'GET') {
             $d['door_sensor_invert'] = (int)($d['door_sensor_invert'] ?? 0);
             $d['is_gate'] = (int)($d['is_gate'] ?? 0);
             $d['gate_state'] = $d['gate_state'] ?? 'idle';
+            $d['gate_inbound_state'] = $d['gate_inbound_state'] ?? $d['gate_state'];
+            $d['gate_outbound_state'] = $d['gate_outbound_state'] ?? $d['gate_state'];
             $d['gate_held'] = (int)($d['gate_held'] ?? 0);
+            $d['hold_open_schedule_id'] = $d['hold_open_schedule_id'] !== null ? (int)$d['hold_open_schedule_id'] : null;
+            $d['gate_config'] = !empty($d['gate_config']) ? json_decode($d['gate_config'], true) : null;
         }
         unset($d);
 
@@ -557,6 +631,7 @@ if ($resource === 'doors') {
             $d['is_gate'] = (int)($d['is_gate'] ?? 0);
             $d['gate_state'] = $d['gate_state'] ?? 'idle';
             $d['gate_held'] = (int)($d['gate_held'] ?? 0);
+            $d['hold_open_schedule_id'] = $d['hold_open_schedule_id'] !== null ? (int)$d['hold_open_schedule_id'] : null;
             $d['gate_config'] = !empty($d['gate_config']) ? json_decode($d['gate_config'], true) : null;
             $d['status_led_config'] = !empty($d['status_led_config']) ? json_decode($d['status_led_config'], true) : null;
             unset($d['api_key']); // Never expose API key to browser
@@ -579,6 +654,8 @@ if ($resource === 'doors') {
             if (isset($ping['version'])) $sets['controller_version'] = $ping['version'];
             if (array_key_exists('door_open', $ping)) $sets['door_open'] = $ping['door_open'];
             if (isset($ping['gate_state'])) $sets['gate_state'] = $ping['gate_state'];
+            if (isset($ping['gate_inbound_state'])) $sets['gate_inbound_state'] = $ping['gate_inbound_state'];
+            if (isset($ping['gate_outbound_state'])) $sets['gate_outbound_state'] = $ping['gate_outbound_state'];
             if (isset($ping['gate_held'])) $sets['gate_held'] = !empty($ping['gate_held']) ? 1 : 0;
             $cols = []; $vals = [];
             foreach ($sets as $col => $val) { $cols[] = "$col = ?"; $vals[] = $val; }
@@ -603,7 +680,10 @@ if ($resource === 'doors') {
         $door['door_sensor_invert'] = (int)($door['door_sensor_invert'] ?? 0);
         $door['is_gate'] = (int)($door['is_gate'] ?? 0);
         $door['gate_state'] = $door['gate_state'] ?? 'idle';
+        $door['gate_inbound_state'] = $door['gate_inbound_state'] ?? $door['gate_state'];
+        $door['gate_outbound_state'] = $door['gate_outbound_state'] ?? $door['gate_state'];
         $door['gate_held'] = (int)($door['gate_held'] ?? 0);
+        $door['hold_open_schedule_id'] = $door['hold_open_schedule_id'] !== null ? (int)$door['hold_open_schedule_id'] : null;
         $door['gate_config'] = !empty($door['gate_config']) ? json_decode($door['gate_config'], true) : null;
         $door['status_led_config'] = !empty($door['status_led_config']) ? json_decode($door['status_led_config'], true) : null;
         unset($door['api_key']);
@@ -635,6 +715,16 @@ if ($resource === 'doors') {
                     $entry = $cfg[$section][$name] ?? null;
                     if ($entry && !empty($entry['enabled']) && !empty($entry['pin'])) {
                         $reserved[(int)$entry['pin']] = "Gate $section.$name";
+                    }
+                }
+            }
+            foreach (['inputs', 'outputs'] as $section) {
+                foreach (['inbound', 'outbound'] as $lane) {
+                    foreach (['open', 'stop', 'close'] as $name) {
+                        $entry = $cfg[$section][$lane][$name] ?? null;
+                        if ($entry && !empty($entry['enabled']) && !empty($entry['pin'])) {
+                            $reserved[(int)$entry['pin']] = "Gate $section.$lane.$name";
+                        }
                     }
                 }
             }
@@ -675,7 +765,14 @@ if ($resource === 'doors') {
             $reader_type = 'wiegand';
         }
 
-        $stmt = $pdo_access->prepare("INSERT INTO doors (name, location, doornum, description, ip_address, schedule_id, unlock_duration, reader_type, poll_interval, listen_port, door_sensor_gpio, door_sensor_invert, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown')");
+        $hold_open_schedule_id = !empty($input['hold_open_schedule_id']) ? (int)$input['hold_open_schedule_id'] : null;
+        if ($hold_open_schedule_id !== null) {
+            $schedule_stmt = $pdo_access->prepare("SELECT id FROM access_schedules WHERE id = ?");
+            $schedule_stmt->execute([$hold_open_schedule_id]);
+            if (!$schedule_stmt->fetchColumn()) json_error('Hold Open Schedule not found');
+        }
+
+        $stmt = $pdo_access->prepare("INSERT INTO doors (name, location, doornum, description, ip_address, schedule_id, hold_open_schedule_id, unlock_duration, reader_type, poll_interval, listen_port, door_sensor_gpio, door_sensor_invert, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown')");
         $stmt->execute([
             $name,
             sanitize_string($input['location'] ?? ''),
@@ -683,6 +780,7 @@ if ($resource === 'doors') {
             sanitize_string($input['description'] ?? ''),
             sanitize_string($input['ip_address'] ?? ''),
             !empty($input['schedule_id']) ? (int)$input['schedule_id'] : null,
+            !empty($input['hold_open_schedule_id']) ? (int)$input['hold_open_schedule_id'] : null,
             (int)($input['unlock_duration'] ?? 5),
             $reader_type,
             (int)($input['poll_interval'] ?? 10),
@@ -762,6 +860,16 @@ if ($resource === 'doors') {
             $fields[] = "schedule_id = ?";
             $params[] = !empty($input['schedule_id']) ? (int)$input['schedule_id'] : null;
         }
+        if (array_key_exists('hold_open_schedule_id', $input)) {
+            $hold_schedule_id = !empty($input['hold_open_schedule_id']) ? (int)$input['hold_open_schedule_id'] : null;
+            if ($hold_schedule_id !== null) {
+                $schedule_stmt = $pdo_access->prepare("SELECT id FROM access_schedules WHERE id = ?");
+                $schedule_stmt->execute([$hold_schedule_id]);
+                if (!$schedule_stmt->fetchColumn()) json_error('Hold Open Schedule not found');
+            }
+            $fields[] = "hold_open_schedule_id = ?";
+            $params[] = $hold_schedule_id;
+        }
         if (array_key_exists('listen_port', $input)) {
             $fields[] = "listen_port = ?";
             $params[] = !empty($input['listen_port']) ? (int)$input['listen_port'] : null;
@@ -810,7 +918,7 @@ if ($resource === 'doors') {
         $pdo_access->prepare("UPDATE doors SET " . implode(', ', $fields) . " WHERE name = ?")->execute($params);
 
         // Push config change to controller if it's online (gate/LED config changes need a restart)
-        if (array_key_exists('gate_config', $input) || array_key_exists('status_led_config', $input) || array_key_exists('is_gate', $input)) {
+        if (array_key_exists('gate_config', $input) || array_key_exists('status_led_config', $input) || array_key_exists('is_gate', $input) || array_key_exists('hold_open_schedule_id', $input)) {
             require_once __DIR__ . '/includes/push.php';
             @push_to_controller($pdo_access, $door_name, 'reload-config');
         }
@@ -918,6 +1026,9 @@ if ($resource === 'doors') {
         $push_cmd = $cmd_map[$action];
         $force = !empty($input['force']);
         $body = $force ? ['force' => true] : [];
+        if (isset($input['lane']) && in_array($input['lane'], ['inbound', 'outbound'], true)) {
+            $body['lane'] = $input['lane'];
+        }
         $result = push_to_controller($pdo_access, $door_name, $push_cmd, $body);
 
         // Distinguish network/transport failure from command-refused.
@@ -943,10 +1054,12 @@ if ($resource === 'doors') {
         }
 
         // Update DB immediately so the UI reflects the new state right away
-        if (isset($result['gate_state']) || isset($result['gate_held'])) {
+        if (isset($result['gate_state']) || isset($result['gate_inbound_state']) || isset($result['gate_outbound_state']) || isset($result['gate_held'])) {
             $sets = [];
             $vals = [];
             if (isset($result['gate_state'])) { $sets[] = 'gate_state = ?'; $vals[] = $result['gate_state']; }
+            if (isset($result['gate_inbound_state'])) { $sets[] = 'gate_inbound_state = ?'; $vals[] = $result['gate_inbound_state']; }
+            if (isset($result['gate_outbound_state'])) { $sets[] = 'gate_outbound_state = ?'; $vals[] = $result['gate_outbound_state']; }
             if (isset($result['gate_held'])) { $sets[] = 'gate_held = ?'; $vals[] = !empty($result['gate_held']) ? 1 : 0; }
             $vals[] = $door_name;
             $pdo_access->prepare("UPDATE doors SET " . implode(', ', $sets) . " WHERE name = ?")->execute($vals);
@@ -975,6 +1088,8 @@ if ($resource === 'doors') {
             if (isset($result['version'])) $sets['controller_version'] = $result['version'];
             if (array_key_exists('door_open', $result)) $sets['door_open'] = $result['door_open'];
             if (isset($result['gate_state'])) $sets['gate_state'] = $result['gate_state'];
+            if (isset($result['gate_inbound_state'])) $sets['gate_inbound_state'] = $result['gate_inbound_state'];
+            if (isset($result['gate_outbound_state'])) $sets['gate_outbound_state'] = $result['gate_outbound_state'];
             if (isset($result['gate_held'])) $sets['gate_held'] = !empty($result['gate_held']) ? 1 : 0;
             $cols = []; $vals = [];
             foreach ($sets as $col => $val) { $cols[] = "$col = ?"; $vals[] = $val; }
@@ -1043,99 +1158,150 @@ if ($resource === 'cards') {
         // Read header row
         $header = fgetcsv($handle);
         if (!$header) { fclose($handle); json_error('Empty CSV file'); }
-        $header = array_map('strtolower', array_map('trim', $header));
+        $header = csv_normalize_headers($header);
 
-        $required = ['user_id'];
+        $required = ['card_id', 'user_id'];
         foreach ($required as $col) {
-            if (!in_array($col, $header)) {
+            if (!in_array($col, $header, true)) {
                 fclose($handle);
                 json_error("Missing required column: $col");
             }
         }
 
-        $skip_duplicates = !empty($input['skip_duplicates'] ?? $_POST['skip_duplicates'] ?? true);
+        $skip_raw = strtolower((string)($input['skip_duplicates'] ?? $_POST['skip_duplicates'] ?? '1'));
+        $skip_duplicates = !in_array($skip_raw, ['0', 'false', 'off', 'no', ''], true);
         $default_group = !empty($input['default_group'] ?? $_POST['default_group'] ?? '') ? (int)($input['default_group'] ?? $_POST['default_group']) : null;
         $default_schedule = !empty($input['default_schedule'] ?? $_POST['default_schedule'] ?? '') ? (int)($input['default_schedule'] ?? $_POST['default_schedule']) : null;
+
+        $valid_groups = [];
+        $group_doors_map = [];
+        foreach ($pdo_access->query("SELECT id, doors FROM access_groups") as $g) {
+            $gid = (int)$g['id'];
+            $valid_groups[$gid] = true;
+            $group_doors_map[$gid] = $g['doors'];
+        }
+        $valid_schedules = [];
+        foreach ($pdo_access->query("SELECT id FROM access_schedules") as $s) {
+            $valid_schedules[(int)$s['id']] = true;
+        }
+
+        if ($default_group !== null && !isset($valid_groups[$default_group])) {
+            fclose($handle);
+            json_error("Unknown default_group: $default_group");
+        }
+        if ($default_schedule !== null && !isset($valid_schedules[$default_schedule])) {
+            fclose($handle);
+            json_error("Unknown default_schedule: $default_schedule");
+        }
 
         $imported = 0;
         $skipped = 0;
         $errors_list = [];
+        $warnings_list = [];
+        $line_num = 1;
+        $header_count = count($header);
+
+        $insert_stmt = $pdo_access->prepare("INSERT INTO cards (card_id, user_id, facility, firstname, lastname, doors, active, email, phone, department, employee_id, company, title, notes, group_id, schedule_id, valid_from, valid_until, daily_scan_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        $dup_stmt = $pdo_access->prepare("SELECT id FROM cards WHERE user_id = ? OR card_id = ?");
+        $master_stmt = $pdo_access->prepare("INSERT INTO master_cards (card_id, user_id, facility, description, active) VALUES (?, ?, ?, ?, 1)");
 
         $pdo_access->beginTransaction();
         try {
             while (($row = fgetcsv($handle)) !== false) {
-                if (count($row) !== count($header)) { $skipped++; continue; }
+                $line_num++;
+                if ($row === [null] || (count($row) === 1 && trim((string)$row[0]) === '')) {
+                    continue;
+                }
+                if (count($row) < $header_count) {
+                    $row = array_pad($row, $header_count, '');
+                } elseif (count($row) > $header_count) {
+                    $row = array_slice($row, 0, $header_count);
+                }
                 $data = array_combine($header, $row);
-
-                $user_id = trim($data['user_id'] ?? '');
-                if (empty($user_id)) { $skipped++; continue; }
-
-                // Check if card already exists (by card_id or user_id)
-                $check = $pdo_access->prepare("SELECT id FROM cards WHERE user_id = ?" . (isset($data['card_id']) && !empty(trim($data['card_id'])) ? " OR card_id = ?" : ""));
-                $check_params = [$user_id];
-                if (isset($data['card_id']) && !empty(trim($data['card_id']))) {
-                    $check_params[] = trim($data['card_id']);
-                }
-                $check->execute($check_params);
-                if ($check->fetch()) {
-                    if ($skip_duplicates) { $skipped++; continue; }
+                if ($data === false) {
+                    $errors_list[] = "Line $line_num: could not parse row";
+                    $skipped++;
+                    continue;
                 }
 
-                $group_id = !empty(trim($data['group_id'] ?? '')) ? (int)$data['group_id'] : $default_group;
-                $schedule_id = !empty(trim($data['schedule_id'] ?? '')) ? (int)$data['schedule_id'] : $default_schedule;
+                $user_id = trim((string)($data['user_id'] ?? ''));
+                $csv_card_id = trim((string)($data['card_id'] ?? ''));
+                if ($user_id === '' || $csv_card_id === '') {
+                    $errors_list[] = "Line $line_num: missing required card_id or user_id";
+                    $skipped++;
+                    continue;
+                }
 
-                // The Wiegand-derived card_id is only included when the CSV
-                // actually supplies it. We never invent one server-side — when
-                // absent it stays NULL and the controller enrolls it on first
-                // scan. Storing a fabricated value would break card matching.
-                $csv_card_id = trim($data['card_id'] ?? '');
-                $has_card_id = ($csv_card_id !== '');
+                $dup_stmt->execute([$user_id, $csv_card_id]);
+                if ($dup_stmt->fetch()) {
+                    if ($skip_duplicates) {
+                        $skipped++;
+                        continue;
+                    }
+                }
+
+                $group_id = !empty(trim((string)($data['group_id'] ?? ''))) ? (int)$data['group_id'] : $default_group;
+                $schedule_id = !empty(trim((string)($data['schedule_id'] ?? ''))) ? (int)$data['schedule_id'] : $default_schedule;
+                if ($group_id !== null && !isset($valid_groups[$group_id])) {
+                    $errors_list[] = "Line $line_num ($user_id): unknown group_id $group_id";
+                    $skipped++;
+                    continue;
+                }
+                if ($schedule_id !== null && !isset($valid_schedules[$schedule_id])) {
+                    $errors_list[] = "Line $line_num ($user_id): unknown schedule_id $schedule_id";
+                    $skipped++;
+                    continue;
+                }
+
+                $facility = trim((string)($data['facility'] ?? ''));
+                $doors = csv_copy_group_doors((string)($data['doors'] ?? ''), $group_id, $group_doors_map);
+                $active = csv_parse_active($data['active'] ?? '1');
+
+                if ($facility === '') {
+                    $warnings_list[] = "Line $line_num ($user_id): no facility — a scan may not match this card";
+                }
+                if ($doors === '') {
+                    $warnings_list[] = "Line $line_num ($user_id): no doors assigned — this card cannot open any door";
+                }
 
                 try {
-                    $stmt = $pdo_access->prepare("INSERT INTO cards (" . ($has_card_id ? "card_id, " : "") . "user_id, facility, firstname, lastname, doors, active, email, phone, department, employee_id, company, title, notes, group_id, schedule_id, valid_from, valid_until, pin_code, daily_scan_limit) VALUES (" . ($has_card_id ? "?, " : "") . "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                    $insert_params = [];
-                    if ($has_card_id) {
-                        $insert_params[] = $csv_card_id;
-                    }
-                    array_push($insert_params,
+                    $insert_stmt->execute([
+                        $csv_card_id,
                         $user_id,
-                        trim($data['facility'] ?? ''),
-                        trim($data['firstname'] ?? ''),
-                        trim($data['lastname'] ?? ''),
-                        trim($data['doors'] ?? ''),
-                        (int)($data['active'] ?? 1),
-                        trim($data['email'] ?? ''),
-                        trim($data['phone'] ?? ''),
-                        trim($data['department'] ?? ''),
-                        trim($data['employee_id'] ?? ''),
-                        trim($data['company'] ?? ''),
-                        trim($data['title'] ?? ''),
-                        trim($data['notes'] ?? ''),
+                        $facility,
+                        trim((string)($data['firstname'] ?? '')),
+                        trim((string)($data['lastname'] ?? '')),
+                        $doors,
+                        $active,
+                        trim((string)($data['email'] ?? '')),
+                        trim((string)($data['phone'] ?? '')),
+                        trim((string)($data['department'] ?? '')),
+                        trim((string)($data['employee_id'] ?? '')),
+                        trim((string)($data['company'] ?? '')),
+                        trim((string)($data['title'] ?? '')),
+                        trim((string)($data['notes'] ?? '')),
                         $group_id,
                         $schedule_id,
-                        !empty(trim($data['valid_from'] ?? '')) ? trim($data['valid_from']) : null,
-                        !empty(trim($data['valid_until'] ?? '')) ? trim($data['valid_until']) : null,
-                        trim($data['pin_code'] ?? ''),
-                        !empty(trim($data['daily_scan_limit'] ?? '')) ? min(999, max(0, (int)$data['daily_scan_limit'])) : null
-                    );
-                    $stmt->execute($insert_params);
+                        !empty(trim((string)($data['valid_from'] ?? ''))) ? trim($data['valid_from']) : null,
+                        !empty(trim((string)($data['valid_until'] ?? ''))) ? trim($data['valid_until']) : null,
+                        !empty(trim((string)($data['daily_scan_limit'] ?? ''))) ? min(999, max(0, (int)$data['daily_scan_limit'])) : null,
+                    ]);
 
-                    // Handle master card. master_cards.card_id must hold the REAL
-                    // Wiegand card_id (not the cards-table auto-increment id), so
-                    // the controller can match a scanned master card. Only create
-                    // the entry when the CSV actually supplied a card_id — without
-                    // it there is nothing for the controller to match against.
-                    $is_master = isset($data['master']) && in_array(strtolower(trim($data['master'])), ['1', 'yes', 'true']);
-                    if ($is_master && $has_card_id) {
+                    $is_master = isset($data['master']) && in_array(strtolower(trim((string)$data['master'])), ['1', 'yes', 'true'], true);
+                    if ($is_master) {
                         try {
-                            $pdo_access->prepare("INSERT INTO master_cards (card_id, user_id, facility, description, active) VALUES (?, ?, ?, ?, 1)")
-                                ->execute([$csv_card_id, $user_id, trim($data['facility'] ?? ''), trim($data['firstname'] ?? '') . ' ' . trim($data['lastname'] ?? '')]);
-                        } catch (PDOException $e) { /* master_cards table may not exist */ }
+                            $master_stmt->execute([
+                                $csv_card_id,
+                                $user_id,
+                                $facility,
+                                trim(trim((string)($data['firstname'] ?? '')) . ' ' . trim((string)($data['lastname'] ?? ''))),
+                            ]);
+                        } catch (PDOException $e) { /* master_cards table may not exist or already present */ }
                     }
 
                     $imported++;
                 } catch (PDOException $e) {
-                    $errors_list[] = "Row $user_id: " . $e->getMessage();
+                    $errors_list[] = "Line $line_num ($user_id): " . $e->getMessage();
                     $skipped++;
                 }
             }
@@ -1148,16 +1314,21 @@ if ($resource === 'cards') {
         fclose($handle);
 
         log_security_event($pdo, 'cards_imported', $_SESSION['user_id'], "CSV import: $imported imported, $skipped skipped");
-        json_success(['imported' => $imported, 'skipped' => $skipped, 'errors' => $errors_list], "Imported $imported cards, skipped $skipped");
+        json_success([
+            'imported' => $imported,
+            'skipped' => $skipped,
+            'errors' => $errors_list,
+            'warnings' => $warnings_list,
+        ], "Imported $imported cards, skipped $skipped");
     }
 
     if ($id === 'export' && $method === 'GET') {
         require_admin_auth();
+        // pin_code is excluded: keypad PIN is stored in card_id (Card ID / PIN).
+        // doors and active are included so export → import round-trips.
         $cards = $pdo_access->query("
-            -- pin_code is deliberately excluded: cardholder PINs must never be
-            -- written into a downloadable export. They remain in the DB for the
-            -- controller to match, but are not surfaced to API/CSV consumers.
-            SELECT c.card_id, c.user_id, c.facility, c.firstname, c.lastname, c.email, c.phone,
+            SELECT c.card_id, c.user_id, c.facility, c.firstname, c.lastname,
+                   c.doors, c.active, c.email, c.phone,
                    c.department, c.employee_id, c.company, c.title, c.notes,
                    c.group_id, c.schedule_id, c.valid_from, c.valid_until,
                    c.daily_scan_limit,
@@ -1166,14 +1337,23 @@ if ($resource === 'cards') {
             ORDER BY c.lastname, c.firstname
         ")->fetchAll(PDO::FETCH_ASSOC);
 
+        $columns = [
+            'card_id', 'user_id', 'facility', 'firstname', 'lastname', 'doors', 'active',
+            'email', 'phone', 'department', 'employee_id', 'company', 'title', 'notes',
+            'group_id', 'schedule_id', 'valid_from', 'valid_until', 'daily_scan_limit', 'master',
+        ];
+
         header('Content-Type: text/csv; charset=UTF-8');
         header('Content-Disposition: attachment; filename="cards_export_' . date('Y-m-d') . '.csv"');
         $out = fopen('php://output', 'w');
-        // UTF-8 BOM for Excel compatibility
         fwrite($out, "\xEF\xBB\xBF");
-        if (!empty($cards)) {
-            fputcsv($out, array_keys($cards[0]));
-            foreach ($cards as $card) fputcsv($out, $card);
+        fputcsv($out, $columns);
+        foreach ($cards as $card) {
+            $row = [];
+            foreach ($columns as $col) {
+                $row[] = $card[$col] ?? '';
+            }
+            fputcsv($out, $row);
         }
         fclose($out);
         exit();

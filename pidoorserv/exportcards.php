@@ -10,9 +10,9 @@ require_admin($config);
 try {
     $stmt = $pdo_access->query("
         SELECT c.card_id, c.user_id, c.facility, c.firstname, c.lastname,
-               c.email, c.phone, c.department, c.employee_id, c.company,
+               c.doors, c.active, c.email, c.phone, c.department, c.employee_id, c.company,
                c.title, c.notes, c.group_id, c.schedule_id,
-               c.valid_from, c.valid_until, c.pin_code, c.daily_scan_limit,
+               c.valid_from, c.valid_until, c.daily_scan_limit,
                CASE WHEN mc.id IS NOT NULL THEN 1 ELSE 0 END AS master
         FROM cards c
         LEFT JOIN master_cards mc ON c.card_id = mc.card_id
@@ -39,9 +39,9 @@ try {
     // Write header row (matches import format)
     fputcsv($output, [
         'card_id', 'user_id', 'facility', 'firstname', 'lastname',
-        'email', 'phone', 'department', 'employee_id', 'company',
+        'doors', 'active', 'email', 'phone', 'department', 'employee_id', 'company',
         'title', 'notes', 'group_id', 'schedule_id',
-        'valid_from', 'valid_until', 'pin_code', 'daily_scan_limit', 'master'
+        'valid_from', 'valid_until', 'daily_scan_limit', 'master'
     ]);
 
     // Write data rows
@@ -52,6 +52,8 @@ try {
             $card['facility'],
             $card['firstname'] ?? '',
             $card['lastname'] ?? '',
+            $card['doors'] ?? '',
+            $card['active'] ?? 1,
             $card['email'] ?? '',
             $card['phone'] ?? '',
             $card['department'] ?? '',
@@ -63,7 +65,6 @@ try {
             $card['schedule_id'] ?? '',
             $card['valid_from'] ?? '',
             $card['valid_until'] ?? '',
-            $card['pin_code'] ?? '',
             $card['daily_scan_limit'] ?? '',
             $card['master']
         ]);

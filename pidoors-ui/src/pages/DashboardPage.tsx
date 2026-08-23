@@ -76,6 +76,13 @@ function StatCard({
   );
 }
 
+function gateStateClass(state: Door['gate_state'] | undefined) {
+  return state === 'open' ? 'badge-warning' :
+    state === 'closed' ? 'badge-success' :
+    state === 'opening' || state === 'closing' ? 'badge-info' :
+    state === 'stopped' ? 'badge-danger' : 'badge-secondary';
+}
+
 function DoorStatusItem({
   door,
   isAdmin,
@@ -105,17 +112,17 @@ function DoorStatusItem({
     }
   };
 
-  const [showClearanceWarning, setShowClearanceWarning] = useState(false);
+  const [pendingClearance, setPendingClearance] = useState<{ lane?: 'inbound' | 'outbound' } | null>(null);
 
-  const handleGate = async (action: 'open' | 'close' | 'stop' | 'hold' | 'release', force?: boolean) => {
+  const handleGate = async (action: 'open' | 'close' | 'stop' | 'hold' | 'release', force?: boolean, lane?: 'inbound' | 'outbound') => {
     try {
-      await gateCommand(door.name, action, force);
+      await gateCommand(door.name, action, force, lane);
       toast.success(`${door.name}: ${action}`);
       onAction();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gate command failed';
       if (msg.includes('Clearance sensor') || msg.includes('obstruction')) {
-        setShowClearanceWarning(true);
+        setPendingClearance({ lane });
         return;
       }
       toast.error(msg);
@@ -130,29 +137,182 @@ function DoorStatusItem({
     );
 
   const isGate = !!door.is_gate;
+  const isDoubleGate = isGate && !!door.gate_config?.double_gate;
+  const isOnline = door.status === 'online';
+  const inboundState = door.gate_inbound_state || door.gate_state;
+  const outboundState = door.gate_outbound_state || door.gate_state;
+
   let stateBadge = null;
-  if (door.status === 'online') {
-    if (isGate) {
-      const cls =
-        door.gate_state === 'open' ? 'badge-warning' :
-        door.gate_state === 'closed' ? 'badge-success' :
-        door.gate_state === 'opening' || door.gate_state === 'closing' ? 'badge-info' :
-        door.gate_state === 'stopped' ? 'badge-danger' : 'badge-secondary';
+  if (isOnline) {
+    if (isGate && !isDoubleGate) {
       stateBadge = (
         <>
-          <span className={`badge ${cls}`}>Gate: {door.gate_state}</span>
+          <span className={`badge ${gateStateClass(door.gate_state)}`}>Gate: {door.gate_state}</span>
           {door.gate_held ? <span className="badge badge-warning">Held</span> : null}
         </>
       );
-    } else if (door.held_open) {
+    } else if (!isGate && door.held_open) {
       stateBadge = <span className="badge badge-warning">Held Open</span>;
-    } else if (door.unlock_requested) {
+    } else if (!isGate && door.unlock_requested) {
       stateBadge = <span className="badge badge-info">Unlocking</span>;
-    } else if (door.locked) {
+    } else if (!isGate && door.locked) {
       stateBadge = <span className="badge badge-success">Locked</span>;
-    } else {
+    } else if (!isGate) {
       stateBadge = <span className="badge badge-warning">Unlocked</span>;
     }
+  }
+
+  const sensorBadge = isOnline && door.door_sensor_gpio !== null && (
+    door.door_open === 1 ? (
+      <span className="badge badge-warning">Sensor: Open</span>
+    ) : door.door_open === 0 ? (
+      <span className="badge badge-success">Sensor: Closed</span>
+    ) : (
+      <span className="badge badge-secondary">Sensor N/A</span>
+    )
+  );
+
+  const statusBadge = (
+    <span
+      className={`badge ${isOnline ? 'badge-success' : door.status === 'offline' ? 'badge-danger' : 'badge-secondary'}`}
+    >
+      <span className="mr-1">{statusIcon}</span>
+      {door.status.charAt(0).toUpperCase() + door.status.slice(1)}
+    </span>
+  );
+
+  const clearanceModal = pendingClearance && (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+      <div className="card w-full max-w-md p-6">
+        <div className="flex items-start gap-3">
+          <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-red-100 dark:bg-red-900/30">
+            <span className="text-xl">⚠️</span>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold text-red-600 dark:text-red-400">
+              Safety Warning
+            </h3>
+            <p className="mt-2 text-sm text-slate-700 dark:text-slate-300">
+              The clearance sensor detects an <strong>obstruction</strong> in the gate's path.
+            </p>
+          </div>
+        </div>
+        <div className="mt-4 rounded-md bg-red-50 p-3 dark:bg-red-900/20">
+          <p className="text-sm text-red-800 dark:text-red-300">
+            Closing the gate while something is in the way could cause <strong>serious injury,
+            death, or property damage</strong>. Only proceed if you have visually confirmed the
+            path is clear and the sensor may be malfunctioning.
+          </p>
+        </div>
+        <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+          By clicking "Override & Close" you accept full responsibility for any consequences.
+        </p>
+        <div className="mt-4 flex justify-end gap-2">
+          <button onClick={() => setPendingClearance(null)} className="btn btn-secondary">
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              const lane = pendingClearance.lane;
+              setPendingClearance(null);
+              handleGate('close', true, lane);
+            }}
+            className="btn btn-danger"
+          >
+            Override & Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  if (isDoubleGate) {
+    return (
+      <div className="border-b border-slate-100 px-4 py-3 last:border-0 dark:border-slate-700/50">
+        <div>
+          <span className="font-medium text-slate-900 dark:text-white">
+            {door.name}
+          </span>
+          {door.location && (
+            <p className="text-xs text-slate-500">{door.location}</p>
+          )}
+        </div>
+
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {statusBadge}
+          {isOnline && (
+            <>
+              <span className="badge badge-secondary">Double Gate</span>
+              {door.gate_held ? <span className="badge badge-warning">Held Both</span> : null}
+              {isAdmin && (door.gate_held ? (
+                <button onClick={() => handleGate('release')} className="btn btn-sm btn-danger">
+                  <LockOpen className="h-3 w-3" />
+                  Release Both
+                </button>
+              ) : (
+                <button onClick={() => handleGate('hold')} className="btn btn-sm btn-ghost">
+                  <Lock className="h-3 w-3" />
+                  Hold-Open
+                </button>
+              ))}
+            </>
+          )}
+          {sensorBadge}
+        </div>
+
+        {isOnline && isAdmin && (
+          <div className="mt-3 space-y-2 border-t border-slate-100 pt-3 dark:border-slate-700">
+            {(['Inbound', 'Outbound'] as const).map((label, index) => {
+              const laneName = label.toLowerCase() as 'inbound' | 'outbound';
+              const laneState = laneName === 'inbound' ? inboundState : outboundState;
+              const isMoving = laneState === 'opening' || laneState === 'closing';
+              return (
+                <div key={laneName}>
+                  <div className="rounded-md bg-slate-50 p-2 dark:bg-slate-800">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold text-slate-700 dark:text-slate-300">{label}</span>
+                      <span className={`badge ${gateStateClass(laneState)}`}>{laneState}</span>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <button
+                        onClick={() => handleGate('open', false, laneName)}
+                        className="btn btn-sm btn-success"
+                        disabled={!!door.gate_held}
+                        title={door.gate_held ? 'Release hold first' : `Open ${label.toLowerCase()} gate`}
+                      >
+                        <ArrowUp className="h-3 w-3" />
+                        Open
+                      </button>
+                      <button
+                        onClick={() => handleGate('stop', false, laneName)}
+                        className="btn btn-sm btn-warning"
+                        disabled={!isMoving}
+                        title={!isMoving ? 'Gate is not moving' : `Stop ${label.toLowerCase()} gate`}
+                      >
+                        <Square className="h-3 w-3" />
+                        Stop
+                      </button>
+                      <button
+                        onClick={() => handleGate('close', false, laneName)}
+                        className="btn btn-sm btn-secondary"
+                        disabled={!!door.gate_held}
+                        title={door.gate_held ? 'Release hold first' : `Close ${label.toLowerCase()} gate`}
+                      >
+                        <ArrowDown className="h-3 w-3" />
+                        Close
+                      </button>
+                    </div>
+                  </div>
+                  {index === 0 && <div className="my-2 border-t border-slate-200 dark:border-slate-700" />}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {clearanceModal}
+      </div>
+    );
   }
 
   return (
@@ -170,22 +330,9 @@ function DoorStatusItem({
 
       <div className="flex items-center gap-2 flex-wrap justify-end">
         {stateBadge}
-        {door.status === 'online' && door.door_sensor_gpio !== null && (
-          door.door_open === 1 ? (
-            <span className="badge badge-warning">Sensor: Open</span>
-          ) : door.door_open === 0 ? (
-            <span className="badge badge-success">Sensor: Closed</span>
-          ) : (
-            <span className="badge badge-secondary">Sensor N/A</span>
-          )
-        )}
-        <span
-          className={`badge ${door.status === 'online' ? 'badge-success' : door.status === 'offline' ? 'badge-danger' : 'badge-secondary'}`}
-        >
-          <span className="mr-1">{statusIcon}</span>
-          {door.status.charAt(0).toUpperCase() + door.status.slice(1)}
-        </span>
-        {door.status === 'online' && isAdmin && isGate && (
+        {sensorBadge}
+        {statusBadge}
+        {isOnline && isAdmin && isGate && (
           <>
             <button
               onClick={() => handleGate('open')}
@@ -227,7 +374,7 @@ function DoorStatusItem({
             )}
           </>
         )}
-        {door.status === 'online' && isAdmin && !isGate && !door.unlock_requested && (
+        {isOnline && isAdmin && !isGate && !door.unlock_requested && (
           <>
             {door.held_open ? (
               <button
@@ -256,46 +403,7 @@ function DoorStatusItem({
         )}
       </div>
 
-      {showClearanceWarning && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="card w-full max-w-md p-6">
-            <div className="flex items-start gap-3">
-              <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-red-100 dark:bg-red-900/30">
-                <span className="text-xl">⚠️</span>
-              </div>
-              <div>
-                <h3 className="text-lg font-semibold text-red-600 dark:text-red-400">
-                  Safety Warning
-                </h3>
-                <p className="mt-2 text-sm text-slate-700 dark:text-slate-300">
-                  The clearance sensor detects an <strong>obstruction</strong> in the gate's path.
-                </p>
-              </div>
-            </div>
-            <div className="mt-4 rounded-md bg-red-50 p-3 dark:bg-red-900/20">
-              <p className="text-sm text-red-800 dark:text-red-300">
-                Closing the gate while something is in the way could cause <strong>serious injury,
-                death, or property damage</strong>. Only proceed if you have visually confirmed the
-                path is clear and the sensor may be malfunctioning.
-              </p>
-            </div>
-            <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
-              By clicking "Override & Close" you accept full responsibility for any consequences.
-            </p>
-            <div className="mt-4 flex justify-end gap-2">
-              <button onClick={() => setShowClearanceWarning(false)} className="btn btn-secondary">
-                Cancel
-              </button>
-              <button
-                onClick={() => { setShowClearanceWarning(false); handleGate('close', true); }}
-                className="btn btn-danger"
-              >
-                Override & Close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {clearanceModal}
     </div>
   );
 }

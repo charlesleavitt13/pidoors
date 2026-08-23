@@ -1,12 +1,13 @@
 import { useState, useMemo, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import {
   CreditCard,
   Plus,
   Pencil,
   Trash2,
   Download,
+  Upload,
   Search,
   Loader2,
   X,
@@ -267,6 +268,10 @@ export function CardsPage() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Cards</h1>
         <div className="flex gap-2">
+          <Link to="/cards/import" className="btn btn-outline">
+            <Upload className="h-4 w-4" />
+            Import CSV
+          </Link>
           <a href={getExportUrl()} className="btn btn-outline" download>
             <Download className="h-4 w-4" />
             Export CSV

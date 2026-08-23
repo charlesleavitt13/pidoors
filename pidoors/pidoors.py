@@ -109,6 +109,7 @@ local_cache = {}
 cache_last_sync = 0
 heartbeat_thread = None
 command_poll_thread = None
+hold_open_schedule_thread = None
 running = True
 door_unlocked = False  # Real-time lock state tracking
 master_cards = {}  # Persistent master cards (never expire)
@@ -119,6 +120,8 @@ current_sensor_pin = None  # Currently active door sensor GPIO pin
 # Gate mode state
 gate_enabled = False           # True if this door is configured as a gate
 gate_state = 'idle'            # idle / opening / closing / stopped / open / closed
+gate_inbound_state = 'idle'    # Independent inbound gate state
+gate_outbound_state = 'idle'   # Independent outbound gate state
 gate_held = False              # True = ignore movement commands until released
 gate_config = {}               # Loaded from DB doors.gate_config
 gate_active_output = None      # Currently active output ('open'/'close'/'stop'/None)
@@ -137,6 +140,12 @@ status_led_active = 1          # Polarity: 1 = active high, 0 = active low
 # Master card hold settings (loaded from DB settings)
 master_scans_hold_open = 3
 master_scans_release_hold = 1
+
+# Scheduled hold-open state. A manual release suppresses reactivation until the
+# current schedule period ends.
+hold_open_schedule_active = False
+hold_open_schedule_suppressed = False
+hold_open_schedule_id = None
 
 # Thread locks for shared state
 state_lock = threading.Lock()  # For db_connected, last_db_attempt, cache_last_sync
@@ -289,6 +298,9 @@ def initialize():
 
     # Start heartbeat thread
     start_heartbeat_thread()
+
+    # Start scheduled hold-open evaluation independently of heartbeat timing.
+    start_hold_open_schedule_thread()
 
     # Start command poll thread (lightweight fast-poll for remote unlock)
     start_command_poll_thread()
@@ -1038,7 +1050,7 @@ def setup_gate_io(cfg):
 
     gate_enabled = True
 
-    # Set up output pins (open/stop/close)
+    # Set up standard gate outputs (legacy single-door mode)
     outputs = gate_config.get('outputs', {})
     for name in ('open', 'stop', 'close'):
         entry = outputs.get(name) or {}
@@ -1050,10 +1062,25 @@ def setup_gate_io(cfg):
         pin = int(pin)
         gate_output_pins[name] = pin
         GPIO.setup(pin, GPIO.OUT)
-        # Initial state = inactive
         active = 1 if entry.get('active_high', True) else 0
         GPIO.output(pin, active ^ 1)
         debug(f"Gate output '{name}' on GPIO {pin}")
+
+    # Double-gate mode duplicates Open/Stop/Close controls for each lane.
+    if gate_config.get('double_gate'):
+        for lane in ('inbound', 'outbound'):
+            lane_outputs = (outputs.get(lane) or {})
+            for action in ('open', 'stop', 'close'):
+                entry = lane_outputs.get(action) or {}
+                if not entry.get('enabled') or not entry.get('pin'):
+                    continue
+                pin = int(entry['pin'])
+                output_name = f'{lane}.{action}'
+                gate_output_pins[output_name] = pin
+                GPIO.setup(pin, GPIO.OUT)
+                active = 1 if entry.get('active_high', True) else 0
+                GPIO.output(pin, active ^ 1)
+                debug(f"Double gate output '{output_name}' on GPIO {pin}")
 
     # Set up input pins (open/stop/close) with debounce + triple-tap detection
     inputs = gate_config.get('inputs', {})
@@ -1076,6 +1103,21 @@ def setup_gate_io(cfg):
         edge = GPIO.FALLING if pull == 'up' else GPIO.RISING
         GPIO.add_event_detect(pin, edge, callback=gate_input_event, bouncetime=debounce_ms)
         debug(f"Gate input '{name}' on GPIO {pin} (pull {pull}, debounce {debounce_ms}ms)")
+
+    if gate_config.get('double_gate'):
+        for lane in ('inbound', 'outbound'):
+            lane_inputs = (inputs.get(lane) or {})
+            for action in ('open', 'stop', 'close'):
+                entry = lane_inputs.get(action) or {}
+                if not entry.get('enabled') or not entry.get('pin'):
+                    continue
+                pin = int(entry['pin'])
+                input_name = f'{lane}.{action}'
+                gate_input_pins[pin] = input_name
+                GPIO.setup(pin, GPIO.IN, pull_up_down=pull_mode)
+                edge = GPIO.FALLING if pull == 'up' else GPIO.RISING
+                GPIO.add_event_detect(pin, edge, callback=gate_input_event, bouncetime=debounce_ms)
+                debug(f"Double gate input '{input_name}' on GPIO {pin}")
 
     # Set up clearance sensor input (optional, used for auto-close safety)
     clearance = inputs.get('clearance') or {}
@@ -1214,7 +1256,13 @@ def gate_input_event(channel):
         # Triple tap = hold action
         report(f"Gate {name} button: triple-tap detected, entering hold")
         gate_tap_state[name] = {'count': 0, 'expires': 0}
-        if name == 'open':
+        if name.endswith('.open'):
+            lane, action = name.split('.', 1)
+            gate_command(action, source='button-3tap', hold_after=True, lane=lane)
+        elif name.endswith('.close'):
+            lane, action = name.split('.', 1)
+            gate_command(action, source='button-3tap', hold_after=True, lane=lane)
+        elif name == 'open':
             gate_command('open', source='button-3tap', hold_after=True)
         elif name == 'close':
             gate_command('close', source='button-3tap', hold_after=True)
@@ -1223,12 +1271,16 @@ def gate_input_event(channel):
     else:
         # Single press = normal action
         report(f"Gate {name} button pressed")
-        ok, reason = gate_command(name, source='button')
+        lane = None
+        action = name
+        if '.' in name:
+            lane, action = name.split('.', 1)
+        ok, reason = gate_command(action, source='button', lane=lane)
 
         # Close blocked by clearance sensor — start monitoring for hold-to-override.
         # If the operator holds the close button down for >1 second, override the
         # sensor and close anyway (operator is physically present as the safety).
-        if not ok and reason == 'clearance_blocked' and name == 'close':
+        if not ok and reason == 'clearance_blocked' and action == 'close':
             _check_close_hold_override(channel)
 
 
@@ -1266,14 +1318,22 @@ def gate_set_state(new_state, held=None):
 
 def _gate_output_active_value(name):
     """Get the active GPIO value (0 or 1) for an output."""
-    entry = (gate_config.get('outputs', {}) or {}).get(name) or {}
+    entry = _gate_output_config(name)
     return 1 if entry.get('active_high', True) else 0
 
 
 def _gate_output_duration(name):
     """Get the configured hold duration for an output (seconds, default 30)."""
-    entry = (gate_config.get('outputs', {}) or {}).get(name) or {}
+    entry = _gate_output_config(name)
     return max(0.1, float(entry.get('duration_seconds', 30)))
+
+
+def _gate_output_config(name):
+    """Return configuration for a legacy or lane-qualified gate output."""
+    if '.' in name:
+        lane, action = name.split('.', 1)
+        return ((gate_config.get('outputs', {}) or {}).get(lane, {}) or {}).get(action) or {}
+    return (gate_config.get('outputs', {}) or {}).get(name) or {}
 
 
 def _gate_set_output(name, on):
@@ -1288,44 +1348,244 @@ def _gate_set_output(name, on):
 
 def _gate_run_output(name, transient_state):
     """Run a gate output for its configured duration. Cuts early if stop_event is set."""
-    global gate_active_output
+    global gate_active_output, gate_inbound_state, gate_outbound_state
     duration = _gate_output_duration(name)
     if not _gate_set_output(name, True):
         return
     with gate_lock:
         gate_active_output = name
     gate_set_state(transient_state)
+    if '.' in name:
+        lane = name.split('.', 1)[0]
+        if lane == 'inbound':
+            gate_inbound_state = transient_state
+        elif lane == 'outbound':
+            gate_outbound_state = transient_state
     debug(f"Gate output '{name}' active for {duration}s")
 
-    # Wait for duration OR stop event
-    interrupted = gate_stop_event.wait(timeout=duration)
+    # Wait for duration OR stop event. Capture the event object so a later
+    # soft-open-cycle wait keeps responding to stop even after gate_command
+    # replaces the global gate_stop_event with a fresh one.
+    stop_event = gate_stop_event
+    interrupted = stop_event.wait(timeout=duration)
     if interrupted:
         debug(f"Gate output '{name}' interrupted by stop")
     _gate_set_output(name, False)
+    lane = name.split('.', 1)[0] if '.' in name else None
+    action = name.split('.', 1)[1] if '.' in name else name
+
+    # Soft open cycle: the gate opener runs its own open->close timing after
+    # the trigger pulse, so report that timing instead of settling on 'open'.
+    entry = _gate_output_config(name)
+    if action == 'open' and not interrupted and entry.get('soft_cycle'):
+        cycle_seconds = max(1.0, float(entry.get('soft_cycle_seconds', 30)))
+        _run_soft_open_cycle(lane, cycle_seconds, stop_event)
+        return
+
     with gate_lock:
         if gate_active_output == name:
             gate_active_output = None
     # Settle final state + reset legacy LEDs back to idle (red)
     _set_legacy_leds(False)
-    if name == 'open':
-        gate_set_state('stopped' if interrupted else 'open')
+    final_state = 'stopped' if interrupted else ('open' if action == 'open' else 'closed' if action == 'close' else 'stopped')
+    if lane == 'inbound':
+        gate_inbound_state = final_state
+    elif lane == 'outbound':
+        gate_outbound_state = final_state
+    if action == 'open':
+        gate_set_state(final_state)
         # Start auto-close timer if open completed normally and conditions are met
         if not interrupted:
             _maybe_start_auto_close()
-    elif name == 'close':
-        gate_set_state('stopped' if interrupted else 'closed')
+    elif action == 'close':
+        gate_set_state(final_state)
     else:
         gate_set_state('stopped')
 
 
-def gate_command(cmd, source='unknown', hold_after=False):
+def _run_soft_open_cycle(lane, cycle_seconds, stop_event):
+    """Report opening/closing timing for a gate-opener-driven cycle; no GPIO is touched here."""
+    global gate_active_output, gate_inbound_state, gate_outbound_state
+    half = cycle_seconds / 2.0
+
+    interrupted = stop_event.wait(timeout=half)
+    if not interrupted:
+        gate_set_state('closing')
+        if lane == 'inbound':
+            gate_inbound_state = 'closing'
+        elif lane == 'outbound':
+            gate_outbound_state = 'closing'
+        interrupted = stop_event.wait(timeout=half)
+
+    with gate_lock:
+        gate_active_output = None
+    _set_legacy_leds(False)
+    final_state = 'stopped' if interrupted else 'closed'
+    if lane == 'inbound':
+        gate_inbound_state = final_state
+    elif lane == 'outbound':
+        gate_outbound_state = final_state
+    gate_set_state(final_state)
+
+
+def _open_output_soft_cycle_seconds(name):
+    """Return the open-cycle duration if that open output has soft_cycle enabled."""
+    entry = _gate_output_config(name)
+    if not entry.get('soft_cycle'):
+        return None
+    return max(1.0, float(entry.get('soft_cycle_seconds', 30)))
+
+
+def _set_lane_gate_state(lane, state):
+    global gate_inbound_state, gate_outbound_state
+    if lane == 'inbound':
+        gate_inbound_state = state
+    elif lane == 'outbound':
+        gate_outbound_state = state
+
+
+def _combined_double_gate_state():
+    states = (gate_inbound_state, gate_outbound_state)
+    for s in ('stopped', 'closing', 'opening'):
+        if s in states:
+            return s
+    if states[0] == states[1]:
+        return states[0]
+    if 'open' in states:
+        return 'open'
+    return 'closed'
+
+
+def _run_soft_close_after_hold(lane_cycles, stop_event):
+    """After hold-open release, report closing for half the soft cycle, then closed.
+
+    The opener closes itself when the hold input drops; no GPIO is driven here.
+    lane_cycles: list of (lane or None, cycle_seconds).
+    """
+    global gate_active_output
+
+    for lane, _seconds in lane_cycles:
+        _set_lane_gate_state(lane, 'closing')
+    gate_set_state('closing', held=False)
+
+    remaining = [(lane, max(0.5, float(seconds) / 2.0)) for lane, seconds in lane_cycles]
+    remaining.sort(key=lambda item: item[1])
+    elapsed = 0.0
+    interrupted = False
+    for lane, half in remaining:
+        wait = half - elapsed
+        if not interrupted and wait > 0:
+            interrupted = bool(stop_event.wait(timeout=wait))
+            if not interrupted:
+                elapsed = half
+        final = 'stopped' if interrupted else 'closed'
+        _set_lane_gate_state(lane, final)
+        if lane is None:
+            gate_set_state(final)
+        else:
+            gate_set_state(_combined_double_gate_state())
+        debug(f"Gate {lane or 'open'} after hold-release -> {final}")
+
+    if interrupted:
+        gate_set_state('stopped')
+    elif lane_cycles and lane_cycles[0][0] is None:
+        gate_set_state('closed')
+    else:
+        gate_set_state(_combined_double_gate_state())
+
+    with gate_lock:
+        if gate_active_output in ('double', 'soft-close'):
+            gate_active_output = None
+    _set_legacy_leds(False)
+
+
+def _should_soft_close_after_hold(double_gate):
+    if double_gate:
+        return (
+            _open_output_soft_cycle_seconds('inbound.open') is not None
+            or _open_output_soft_cycle_seconds('outbound.open') is not None
+        )
+    return _open_output_soft_cycle_seconds('open') is not None
+
+
+def _gate_run_double_hold_open():
+    """Open both double-gate lanes and hold both open until released."""
+    global gate_active_output, gate_inbound_state, gate_outbound_state, gate_stop_event
+
+    targets = ('inbound.open', 'outbound.open')
+    if not all(_gate_set_output(target, True) for target in targets):
+        for target in targets:
+            _gate_set_output(target, False)
+        return False
+
+    with gate_lock:
+        gate_active_output = 'double'
+        gate_inbound_state = 'opening'
+        gate_outbound_state = 'opening'
+    gate_set_state('opening')
+    gate_inbound_state = 'open'
+    gate_outbound_state = 'open'
+    gate_set_state('open', held=True)
+
+    # Keep both relays active until the shared release command. This is
+    # intentionally different from a normal timed open command.
+    gate_stop_event.wait()
+    for target in targets:
+        _gate_set_output(target, False)
+
+    _set_legacy_leds(False)
+
+    # Stop-during-hold leaves gate_held True; only a real release should
+    # start the soft-cycle close report.
+    if gate_held:
+        with gate_lock:
+            if gate_active_output == 'double':
+                gate_active_output = None
+        return True
+
+    lane_cycles = []
+    inbound_cycle = _open_output_soft_cycle_seconds('inbound.open')
+    outbound_cycle = _open_output_soft_cycle_seconds('outbound.open')
+    if inbound_cycle is not None:
+        lane_cycles.append(('inbound', inbound_cycle))
+    else:
+        gate_inbound_state = 'open'
+    if outbound_cycle is not None:
+        lane_cycles.append(('outbound', outbound_cycle))
+    else:
+        gate_outbound_state = 'open'
+
+    if not lane_cycles:
+        with gate_lock:
+            if gate_active_output == 'double':
+                gate_active_output = None
+        gate_set_state('open', held=False)
+        return True
+
+    # Fresh event: the hold-wait event is already set by release, so a
+    # subsequent wait on it would return immediately.
+    close_event = threading.Event()
+    with gate_lock:
+        gate_stop_event = close_event
+        gate_active_output = 'double'
+    _run_soft_close_after_hold(lane_cycles, close_event)
+    return True
+
+
+def gate_command(cmd, source='unknown', hold_after=False, lane=None):
     """Execute a gate command. Returns (ok, reason) tuple.
     ok=True, reason=None if accepted.
     ok=False, reason='...' if blocked."""
     global gate_active_output, gate_stop_event
+    global hold_open_schedule_active, hold_open_schedule_suppressed
 
     if not gate_enabled:
         return False, 'not_a_gate'
+
+    double_gate = bool(gate_config.get('double_gate'))
+    if double_gate and cmd in ('open', 'close'):
+        # Credential access defaults to inbound; dashboard close defaults to outbound.
+        lane = lane or ('inbound' if cmd == 'open' else 'outbound')
 
     # Any command other than 'release' (which un-holds and is otherwise a no-op)
     # cancels a pending auto-close. The auto-close is meant to fire only when
@@ -1339,33 +1599,66 @@ def gate_command(cmd, source='unknown', hold_after=False):
         return False, 'held'
 
     if cmd == 'release':
+        was_held = gate_held
+        was_open = (gate_state == 'open')
+        # Clear held before waking the double-gate hold thread so it can tell
+        # release apart from stop (stop leaves gate_held True).
+        if source != 'schedule' and hold_open_schedule_active:
+            hold_open_schedule_suppressed = True
+            hold_open_schedule_active = False
         gate_set_state(gate_state, held=False)
+        if double_gate and was_held:
+            gate_stop_event.set()
         report(f"Gate hold released ({source})")
-        # Releasing hold while gate is open should restart the auto-close timer
-        if gate_state == 'open':
+        soft_close = was_held and was_open and _should_soft_close_after_hold(double_gate)
+        if soft_close and not double_gate:
+            cycle_seconds = _open_output_soft_cycle_seconds('open')
+            if cycle_seconds:
+                close_event = threading.Event()
+                with gate_lock:
+                    gate_stop_event = close_event
+                    gate_active_output = 'soft-close'
+                threading.Thread(
+                    target=_run_soft_close_after_hold,
+                    args=([(None, cycle_seconds)], close_event),
+                    daemon=True,
+                ).start()
+        elif was_open and not soft_close:
             _maybe_start_auto_close()
         return True, None
 
     if cmd == 'hold':
+        if double_gate:
+            targets = ('inbound.open', 'outbound.open')
+            if not all(target in gate_output_pins for target in targets):
+                report("Double gate hold refused: both inbound and outbound open outputs are required")
+                return False, 'no_output_configured'
+            if gate_active_output:
+                debug("Double gate hold ignored — a gate output is already active")
+                return False, 'already_running'
+            gate_stop_event = threading.Event()
+            threading.Thread(target=_gate_run_double_hold_open, daemon=True).start()
+            report(f"Double gate hold open ({source})")
+            return True, None
         gate_set_state(gate_state, held=True)
         report(f"Gate held in current state: {gate_state} ({source})")
         return True, None
 
     if cmd == 'stop':
-        # Only stop if the gate is actually moving — no point going to "stopped"
-        # from idle/open/closed because we'd lose track of the real position
         if not gate_active_output and gate_state not in ('opening', 'closing'):
             debug(f"Gate stop ignored — not currently moving (state: {gate_state})")
             return False, 'not_moving'
-        # Cut any active output
         if gate_active_output:
             debug(f"Gate stop interrupting active output '{gate_active_output}'")
             gate_stop_event.set()
-            time.sleep(0.05)  # Let the output thread react
+            time.sleep(0.05)
             gate_stop_event = threading.Event()
-        # Fire stop output if configured
-        if 'stop' in gate_output_pins:
-            threading.Thread(target=_gate_run_output, args=('stop', 'stopped'), daemon=True).start()
+        stop_target = 'stop'
+        if double_gate:
+            active_lane = gate_active_output.split('.', 1)[0] if gate_active_output and '.' in gate_active_output else lane
+            stop_target = f'{active_lane}.stop' if active_lane else stop_target
+        if stop_target in gate_output_pins:
+            threading.Thread(target=_gate_run_output, args=(stop_target, 'stopped'), daemon=True).start()
         else:
             gate_set_state('stopped')
         if hold_after:
@@ -1375,57 +1668,51 @@ def gate_command(cmd, source='unknown', hold_after=False):
         return True, None
 
     if cmd in ('open', 'close'):
-        if cmd not in gate_output_pins:
-            report(f"Gate '{cmd}' refused: no output pin configured")
+        target = f'{lane}.{cmd}' if double_gate and lane else cmd
+
+        if target not in gate_output_pins:
+            report(f"Gate '{target}' refused: no output pin configured")
             return False, 'no_output_configured'
 
-        # Clearance sensor safety: block close if sensor detects obstruction.
-        # Only applies when a clearance sensor IS configured. Without a sensor,
-        # close is always allowed. The 'override' source means the physical
-        # button is being held down — operator is acting as the safety.
         if cmd == 'close' and gate_clearance_pin is not None and not gate_clearance_clear:
             if source != 'button-hold-override':
                 report(f"Gate close blocked: clearance sensor reports obstruction ({source})")
                 return False, 'clearance_blocked'
 
-        # Same-direction = ignore (let current cycle complete)
-        if gate_active_output == cmd:
-            debug(f"Gate '{cmd}' ignored — already in progress")
+        if gate_active_output == target:
+            debug(f"Gate '{target}' ignored — already in progress")
             return False, 'already_running'
 
-        # Opposite-direction = stop, brief pause, then reverse
-        if gate_active_output and gate_active_output != cmd:
-            debug(f"Gate '{cmd}' reversing from active '{gate_active_output}'")
+        if gate_active_output and gate_active_output != target:
+            debug(f"Gate '{target}' reversing from active '{gate_active_output}'")
             gate_stop_event.set()
             time.sleep(0.1)
 
-        # Make sure stop_event is fresh for the new run
         gate_stop_event = threading.Event()
-
         transient = 'opening' if cmd == 'open' else 'closing'
 
         def _runner():
-            _gate_run_output(cmd, transient)
+            _gate_run_output(target, transient)
             if hold_after:
                 gate_set_state(gate_state, held=True)
 
         threading.Thread(target=_runner, daemon=True).start()
-        report(f"Gate {cmd} ({source})")
+        report(f"Gate {target} ({source})")
         return True, None
 
     return False, 'unknown_command'
 
 
 def gate_grant_access(name):
-    """Called when a card scan or REX grants access on a gate. Triggers open output."""
+    """Called when a card scan or REX grants access on a gate.
+    In double-gate mode, only the inbound gate opens for access events."""
     if not gate_enabled:
         return False
     if gate_held:
         report(f"Card access denied — gate is held. Master scan to release.")
         return False
-    # Toggle legacy LEDs for visual feedback (green while opening)
     _set_legacy_leds(True)
-    ok, _reason = gate_command('open', source=f'access:{name}')
+    ok, _reason = gate_command('open', source=f'access:{name}', lane='inbound' if gate_config.get('double_gate') else None)
     if not ok:
         _set_legacy_leds(False)
     return ok
@@ -1433,7 +1720,7 @@ def gate_grant_access(name):
 
 def apply_door_settings(door_info):
     """Apply gate config, LED config, and persisted hold state from DB door row."""
-    global gate_state, gate_held, gate_enabled
+    global gate_state, gate_held, gate_enabled, gate_inbound_state, gate_outbound_state
     if not door_info:
         return
 
@@ -1451,6 +1738,8 @@ def apply_door_settings(door_info):
         # Restore persisted state
         with gate_lock:
             gate_state = door_info.get('gate_state') or 'idle'
+            gate_inbound_state = door_info.get('gate_inbound_state') or gate_state
+            gate_outbound_state = door_info.get('gate_outbound_state') or gate_state
             gate_held = bool(door_info.get('gate_held'))
         debug(f"Gate restored: state={gate_state} held={gate_held}")
     else:
@@ -1464,6 +1753,8 @@ def apply_door_settings(door_info):
         gate_enabled = False
         with gate_lock:
             gate_state = 'idle'
+            gate_inbound_state = 'idle'
+            gate_outbound_state = 'idle'
             gate_held = False
 
     # Status LED config
@@ -2336,6 +2627,7 @@ def open_door(user_id, name, is_master=False):
     Only master cards can toggle held-open / hold state.
     Configurable via master_scans_hold_open / master_scans_release_hold settings."""
     global last_card, repeat_read_timeout, repeat_read_count
+    global hold_open_schedule_active, hold_open_schedule_suppressed
 
     now = time.time()
 
@@ -2364,7 +2656,8 @@ def open_door(user_id, name, is_master=False):
         elif is_master and current_repeat_count >= master_scans_hold_open:
             # Triple master scan = hold (after firing open)
             report(f"{zone} GATE HOLD by {name}")
-            gate_command('open', source=f'master:{name}', hold_after=True)
+            hold_command = 'hold' if gate_config.get('double_gate') else 'open'
+            gate_command(hold_command, source=f'master:{name}', hold_after=True)
             log_door_event('door_held_open', f"Held by {name}")
         else:
             report(f"{name} granted gate access to {zone}")
@@ -2377,6 +2670,9 @@ def open_door(user_id, name, is_master=False):
     if is_master and zone_config.get("unlocked") and current_repeat_count >= master_scans_release_hold:
         # Single master scan while held-open -> release hold
         zone_config["unlocked"] = False
+        if hold_open_schedule_active:
+            hold_open_schedule_suppressed = True
+            hold_open_schedule_active = False
         report(f"{zone} hold released by {name}")
         lock_door()
         log_door_event('lock', f"Hold released by {name}")
@@ -2518,6 +2814,75 @@ def log_door_event(event_type, details=""):
 # HEARTBEAT / HEALTH CHECK
 # ============================================================
 
+def start_hold_open_schedule_thread():
+    """Start the periodic scheduled hold-open evaluator."""
+    global hold_open_schedule_thread
+    hold_open_schedule_thread = threading.Thread(target=hold_open_schedule_loop, daemon=True)
+    hold_open_schedule_thread.start()
+
+
+def evaluate_hold_open_schedule():
+    """Apply or release the configured per-door scheduled hold-open state."""
+    global hold_open_schedule_active, hold_open_schedule_suppressed, hold_open_schedule_id
+
+    with cache_lock:
+        door_settings = dict(local_cache.get('door_settings') or {})
+    schedule_id = door_settings.get('hold_open_schedule_id')
+    if schedule_id != hold_open_schedule_id:
+        hold_open_schedule_id = schedule_id
+        hold_open_schedule_active = False
+        hold_open_schedule_suppressed = False
+    if not schedule_id:
+        if hold_open_schedule_active:
+            _release_scheduled_hold()
+        hold_open_schedule_active = False
+        hold_open_schedule_suppressed = False
+        return
+
+    active = check_schedule(schedule_id, datetime.now())
+    if not active:
+        if hold_open_schedule_active:
+            _release_scheduled_hold()
+        hold_open_schedule_active = False
+        hold_open_schedule_suppressed = False
+        return
+
+    if hold_open_schedule_suppressed or hold_open_schedule_active:
+        return
+
+    if gate_enabled:
+        ok, _reason = gate_command('hold', source='schedule')
+    else:
+        zone_config = config.get(zone, {})
+        zone_config['unlocked'] = True
+        unlock_door()
+        ok = True
+    if ok:
+        hold_open_schedule_active = True
+        report(f"{zone} scheduled hold-open active")
+
+
+def _release_scheduled_hold():
+    """Release only the hold created by the schedule; do not force a close."""
+    if gate_enabled:
+        gate_command('release', source='schedule')
+    else:
+        zone_config = config.get(zone, {})
+        zone_config['unlocked'] = False
+        lock_door()
+    report(f"{zone} scheduled hold-open released")
+
+
+def hold_open_schedule_loop():
+    """Evaluate scheduled hold-open state without depending on heartbeat cadence."""
+    while running:
+        try:
+            evaluate_hold_open_schedule()
+        except Exception as e:
+            report(f"Scheduled hold-open evaluation error: {e}")
+        time.sleep(15)
+
+
 def start_heartbeat_thread():
     """Start the heartbeat thread for server communication"""
     global heartbeat_thread
@@ -2620,9 +2985,11 @@ def send_heartbeat():
                 api_key = %s,
                 door_open = %s,
                 gate_state = %s,
+                gate_inbound_state = %s,
+                gate_outbound_state = %s,
                 gate_held = %s
             WHERE name = %s
-        """, (myip, locked_status, held_open_val, VERSION, push_listener_port, controller_api_key, door_open_val, gate_state, 1 if gate_held else 0, zone))
+        """, (myip, locked_status, held_open_val, VERSION, push_listener_port, controller_api_key, door_open_val, gate_state, gate_inbound_state, gate_outbound_state, 1 if gate_held else 0, zone))
 
         # Auto-register door if it doesn't exist yet
         if cursor.rowcount == 0:
@@ -2706,7 +3073,7 @@ def start_command_poll_thread():
 
 def command_poll_loop():
     """Lightweight fast-polling loop that checks for remote commands and sends lock state"""
-    global running
+    global running, hold_open_schedule_active, hold_open_schedule_suppressed
 
     if not MYSQL_AVAILABLE:
         return
@@ -2773,6 +3140,9 @@ def command_poll_loop():
                 elif hold_req == 2 and zone_config.get("unlocked", False):
                     zone_config["unlocked"] = False
                     lock_door()
+                    if hold_open_schedule_active:
+                        hold_open_schedule_suppressed = True
+                        hold_open_schedule_active = False
                     log_door_event('lock', 'Hold released by admin')
                     report("Door hold released by admin request")
                     cursor.execute(
@@ -2886,6 +3256,8 @@ def _get_status_dict():
         'door_open': door_open_val,
         'is_gate': gate_enabled,
         'gate_state': gate_state,
+        'gate_inbound_state': gate_inbound_state,
+        'gate_outbound_state': gate_outbound_state,
         'gate_held': gate_held,
     }
 
@@ -2916,7 +3288,7 @@ def _run_push_listener(port, api_key, cert_file, key_file):
             self.wfile.write(payload)
 
         def do_POST(self):
-            global zone
+            global zone, hold_open_schedule_active, hold_open_schedule_suppressed
             if not self._check_auth():
                 return
 
@@ -2946,6 +3318,9 @@ def _run_push_listener(port, api_key, cert_file, key_file):
                 if zone_config.get('unlocked', False):
                     zone_config['unlocked'] = False
                     lock_door()
+                    if hold_open_schedule_active:
+                        hold_open_schedule_suppressed = True
+                        hold_open_schedule_active = False
                     log_door_event('lock', 'Hold released by push command')
                     report(f"Push: hold released from {client_ip}")
                 self._respond(200, {'ok': True, 'held_open': False})
@@ -3018,11 +3393,18 @@ def _run_push_listener(port, api_key, cert_file, key_file):
                 content_length = int(self.headers.get('Content-Length', 0))
                 body = json.loads(self.rfile.read(content_length)) if content_length else {}
                 source = f'push:{client_ip}'
+                lane = body.get('lane') if body.get('lane') in ('inbound', 'outbound') else None
                 if body.get('force') and gate_action == 'close':
                     source = 'button-hold-override'  # Same source as physical hold-override
                 report(f"Push: gate/{gate_action} from {client_ip}" + (' (force)' if body.get('force') else ''))
-                ok, reason = gate_command(gate_action, source=source)
-                response = {'ok': ok, 'gate_state': gate_state, 'gate_held': gate_held}
+                ok, reason = gate_command(gate_action, source=source, lane=lane)
+                response = {
+                    'ok': ok,
+                    'gate_state': gate_state,
+                    'gate_inbound_state': gate_inbound_state,
+                    'gate_outbound_state': gate_outbound_state,
+                    'gate_held': gate_held,
+                }
                 if reason:
                     response['reason'] = reason
                 self._respond(200, response)

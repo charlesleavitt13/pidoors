@@ -29,9 +29,23 @@ export async function deleteCard(id: string): Promise<ApiResponse> {
   return api(`cards/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-export async function importCards(file: File): Promise<ApiResponse & { imported?: number; skipped?: number }> {
+export async function importCards(
+  file: File,
+  options?: {
+    default_group?: number | null;
+    default_schedule?: number | null;
+    skip_duplicates?: boolean;
+  }
+): Promise<ApiResponse & { imported?: number; skipped?: number; errors?: string[]; warnings?: string[] }> {
   const formData = new FormData();
   formData.append('file', file);
+  if (options?.default_group) {
+    formData.append('default_group', String(options.default_group));
+  }
+  if (options?.default_schedule) {
+    formData.append('default_schedule', String(options.default_schedule));
+  }
+  formData.append('skip_duplicates', options?.skip_duplicates === false ? '0' : '1');
   return api('cards/import', {
     method: 'POST',
     body: formData,
