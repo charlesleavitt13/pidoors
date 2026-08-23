@@ -56,6 +56,7 @@ PiDoors is a complete, industrial-grade access control system built on Raspberry
 
 ### Access Control
 - **Multi-format Wiegand**: 26, 32, 34, 35, 36, 37, 48-bit with auto-detection
+- **Keypad PIN access**: Wiegand keypads (4-digit PIN, `#` to submit) — PIN is the card's **Card ID / PIN** field, authorized online
 - **OSDP Readers**: RS-485 encrypted readers (planned — reader module included, not yet integrated)
 - **NFC/RFID**: PN532 and MFRC522 support (planned — reader modules included, not yet integrated)
 - Time-based access schedules
@@ -69,12 +70,15 @@ PiDoors is a complete, industrial-grade access control system built on Raspberry
 - Toggle any door into **gate mode** for rolling/sliding gates with motor controllers
 - 3 configurable inputs (open / stop / close physical buttons)
 - 3 configurable outputs (open / stop / close relays to gate motor)
+- **Double gate mode** — independent inbound and outbound lanes, each with its own open/stop/close I/O
+- **Soft Open Cycle** — for openers that run their own open/close timing after a trigger pulse
 - Per-output hold duration, configurable polarity, configurable GPIO pins
 - Triple-tap any button to enter hold-current-state
 - Master card 3-scan = hold open (configurable)
+- **Scheduled hold-open** — automatically hold a door or gate open during a selected schedule
 - Stop interrupts the active output immediately
 - Reverse direction commands automatically stop and reverse
-- Web UI shows live gate state (idle/opening/closing/stopped/open/closed) and dedicated control buttons
+- Web UI and dashboard show live gate state (idle/opening/closing/stopped/open/closed) with dedicated control buttons, including per-lane controls in double-gate mode
 - State persists across controller restarts
 - Server-side pin conflict checker prevents double-assigning GPIO pins
 
@@ -89,7 +93,7 @@ PiDoors is a complete, industrial-grade access control system built on Raspberry
 - Real-time dashboard with analytics
 - Multi-user administration with extended profiles (name, department, company, etc.)
 - Extended cardholder details (email, phone, department, employee ID, company, title)
-- CSV bulk import/export with all cardholder fields (including master card flag)
+- CSV bulk import/export with all cardholder fields (including door list, active status, and master card flag)
 - Comprehensive reporting
 - Email notifications
 - Complete audit trail
@@ -153,26 +157,30 @@ The installer presents three installation modes:
 | **2) Door Controller** | GPIO + card reader daemon (run on each door Pi) |
 | **3) Full** | Both server and controller on one Pi (small deployments) |
 
+To remove an installation later, run `sudo ./uninstall.sh` on the same machine. It can remove the server, the door controller, or both, and optionally back up then wipe the database.
+
 #### What the installer does
 
 1. Updates system packages
 2. Installs dependencies (Nginx, PHP-FPM, MariaDB, Node.js, Python libraries)
-3. Generates TLS certificates and enables encrypted database connections
+3. Generates TLS certificates (with proper CA/server extensions) and enables **one-way** encrypted MariaDB connections
 4. Creates the `users` and `access` databases with all required tables
 5. Imports the full database schema (base tables + migration extensions)
 6. Deploys the PHP API to `/var/www/pidoors/`
 7. Builds the React SPA and deploys to `/var/www/pidoors-ui/`
 8. Configures Nginx to serve the SPA with `/api/*` routed to PHP-FPM
 9. Prompts you to create an admin account (username, email + password)
-10. Sets up log rotation and backup scripts
+10. Generates a **controller enrollment token** (printed at the end — required when installing remote door Pis)
+11. Sets up log rotation and backup scripts
 
 #### After installation
 
 1. Open `https://your-pi-ip/` in a browser
 2. Log in with the email (or username `Admin`) and password you set during install
-3. Navigate to **Doors** to see your door controllers as they come online
-4. Navigate to **Cards** to add access cards
-5. Set up **Schedules** and **Access Groups** as needed
+3. **Write down the enrollment token** shown at the end of a server install. Remote door controllers will ask for it. It is also stored in `/var/www/pidoors/includes/config.php` as `enrollment_token`.
+4. Navigate to **Doors** to see your door controllers as they come online
+5. Navigate to **Cards** to add access cards (the **Card ID / PIN** field is both the Wiegand card number and the keypad PIN)
+6. Set up **Schedules** and **Access Groups** as needed. Assign a **Hold Open Schedule** on a door if it should stay unlocked during those hours.
 
 ### Manual Installation
 
@@ -382,8 +390,10 @@ return [
     'sqldb2' => 'access',
     'sqluser' => 'pidoors',
     'sqlpass' => 'your_secure_password',
+    'sql_ssl_ca' => '/etc/mysql/ssl/ca.pem',
     'url' => 'https://your-pi-ip',
-    // ... other settings
+    'enrollment_token' => 'long_random_hex', // required to enroll door controllers
+    // 'timezone' is a fallback only; the Settings page is authoritative
 ];
 ```
 
@@ -412,16 +422,21 @@ nano pidoors/conf/config.json
         "d0": 24,
         "d1": 23,
         "wiegand_format": "auto",
+        "keypad_enabled": false,
+        "keypad_pin_timeout_seconds": 15,
         "latch_gpio": 18,
         "open_delay": 5,
         "unlock_value": 1,
         "sqladdr": "SERVER_IP_ADDRESS",
         "sqluser": "pidoors",
         "sqlpass": "your_database_password",
-        "sqldb": "access"
+        "sqldb": "access",
+        "sql_ssl_ca": "/opt/pidoors/conf/ca.pem"
     }
 }
 ```
+
+Set `keypad_enabled` to `true` on Wiegand keypads to accept 4-digit PINs (`#` submits, `*` is ignored). PIN access requires a live database connection and matches the entered digits to the card's **Card ID / PIN** field. See [Keypad PIN Access](#keypad-pin-access).
 
 ---
 
@@ -473,6 +488,10 @@ For rolling/sliding gates with motor controllers, enable **Gate Mode** in the do
 
 In gate mode, the regular **Lock Relay** is unused — the gate's open/close outputs replace it. The "Unlock Duration" field in the door edit page is automatically hidden when gate mode is enabled. Each gate output has its own configurable hold duration.
 
+**Double gate mode** — for sites with a separate inbound and outbound gate (or two independent leaves). Enable **Double gate mode** on the door edit page. Each lane gets its own open/stop/close inputs and outputs. Card scans and REX open the **inbound** lane only. Dashboard **Close** defaults to the **outbound** lane. **Hold-Open** holds both lanes open until released.
+
+**Soft Open Cycle** — enable this on an **Open** relay when the gate opener (not PiDoors) runs its own open/close timing after a short trigger pulse. The relay **Hold (sec)** is the pulse length; **Open Cycle Duration** is how long the UI reports the opener's motion (opening for half the duration, then closing, then closed). After a hold-open is released, the opener closes itself when the hold input drops; PiDoors reports closing for half the cycle, then closed.
+
 ### LED Feedback
 
 PiDoors supports two LED output methods:
@@ -510,9 +529,11 @@ Full wiring diagrams available in [Installation Guide](pidoors/INSTALLATION_GUID
 
 **Via Web Interface:**
 1. Navigate to **Cards** > **Add Card**
-2. Enter card details (scan card at reader to get ID)
+2. Enter **Card ID / PIN** (scan the card at the reader, or type the keypad PIN you want to assign) and **User ID**
 3. Assign access groups and schedules
 4. Click **Add Card**
+
+The **Card ID / PIN** value is unique. The same field is used for Wiegand card numbers and keypad PINs — there is no separate PIN field.
 
 **Via CSV Import:**
 ```csv
@@ -523,12 +544,29 @@ b2c3d4e5,EMP002,123,Jane,Doe,front-door,1,jane@example.com,Marketing
 
 Upload at **Cards** > **Import CSV**. Required: `card_id`, `user_id`. Needed to grant access: `facility` (must match the reader) and `doors` (comma-separated door names, or `*`). If `doors` is empty and `group_id` is set (or a default group is chosen), that group's doors are copied onto the card. Optional: `firstname`, `lastname`, `active`, `email`, `phone`, `department`, `employee_id`, `company`, `title`, `notes`, `group_id`, `schedule_id`, `valid_from`, `valid_until`, `daily_scan_limit`, `master`. Keypad PIN is `card_id`; a `pin_code` column is ignored. Export CSV uses the same columns so a round-trip re-import keeps door access and active status.
 
+### Keypad PIN Access
+
+On a Wiegand keypad (for example a Retekess T-AC04), enable PIN entry in the door controller config:
+
+```json
+"keypad_enabled": true,
+"keypad_pin_timeout_seconds": 15
+```
+
+Then:
+1. Enter up to four digits
+2. Press `#` to submit (`*` is ignored)
+3. The PIN is matched against the cardholder's **Card ID / PIN** field
+
+PIN access is online-only (the controller must reach the database). Ambiguous matches — two cards with the same Card ID — are refused rather than granted. To capture an undocumented keypad's key frames, see the [Installation Guide](pidoors/INSTALLATION_GUIDE.md#diagnosing-an-undocumented-wiegand-keypad).
+
 ### Creating Access Schedules
 
 1. Go to **Schedules** > **Add Schedule**
 2. Name the schedule (e.g., "Business Hours")
 3. Set time windows for each day
-4. Assign to cards or doors
+4. Assign to cards (when they may enter) or doors (when the door itself may be used)
+5. Optionally assign the same schedule as a door's **Hold Open Schedule** so the door or gate stays unlocked during those hours. A manual release suppresses scheduled hold-open until the next schedule period. When the window ends, the hold is released without forcing a gate closed.
 
 ### Monitoring Access
 
@@ -540,6 +578,15 @@ Upload at **Cards** > **Import CSV**. Required: `card_id`, `user_id`. Needed to 
 ---
 
 ## Maintenance
+
+### Uninstall
+
+```bash
+cd ~/pidoors
+sudo ./uninstall.sh
+```
+
+Choose **1) Server**, **2) Door Controller**, or **3) Both**. For a server uninstall you can keep the database, back it up then wipe it, or wipe it without a backup. Type `yes` to confirm. A database backup (if requested) is written to `/var/backups/pidoors/`.
 
 ### Automatic Backups
 Backups run daily at 2 AM to `/var/backups/pidoors/`
@@ -671,6 +718,7 @@ pidoors/
 │   └── mock_gpio.py      # Mock GPIO for containerized door
 ├── VERSION               # Current version number
 ├── install.sh            # Installation script
+├── uninstall.sh          # Server / controller / both uninstaller
 ├── server-update.sh      # Server self-update script
 ├── database_migration.sql
 └── README.md
@@ -720,6 +768,28 @@ Contributions welcome! Please:
 ## Changelog
 
 > **Note:** Version numbering was reset from 3.x to 0.x in April 2026. The project had rapidly iterated from v1.0 to v3.2 during initial development. The 0.x series reflects pre-release status as the system matures toward a proper v1.0.0 release.
+
+### Unreleased (August 2026)
+**Installer, keypad PIN, double gates, scheduled hold-open, and soft open cycle.**
+
+Installer:
+- Fresh `sudo ./install.sh` now completes end-to-end: MariaDB TLS certs include CA and server X.509 extensions, MariaDB is configured for **one-way TLS** (no `ssl-ca` in the server chain), and `sql_ssl_ca` is written into the PHP config.
+- A random **enrollment token** is generated on server install, printed in the summary, stored in `config.php`, and required when signing a controller certificate. Same-machine (full) installs reuse the token automatically; remote door Pis are prompted for it.
+- New `uninstall.sh` removes the server, door controller, or both, with optional database backup/wipe.
+
+Access control:
+- **Keypad PIN access** on Wiegand keypads: up to four digits, `#` submits, `*` ignored. The PIN is the card's **Card ID / PIN** field (no separate PIN column). Online-only; unique Card ID required.
+- Add Card form writes **Card ID** and **User ID** as separate fields (previously the form overwrote Card ID with User ID).
+- CSV import/export round-trips `facility`, `doors`, `active`, `daily_scan_limit`, and `master`. Keypad PIN is `card_id`; a `pin_code` column is ignored.
+
+Gates and doors:
+- **Double gate mode** — independent inbound/outbound lanes with per-lane open/stop/close I/O and live state. Card scans open inbound only; hold-open holds both lanes.
+- **Scheduled hold-open** — optional per-door schedule that holds a door unlocked or a gate open during those hours. Evaluated every 15 seconds (not tied to heartbeat). Manual release suppresses until the next period.
+- **Soft Open Cycle** — for gate openers that time their own motion after a trigger pulse. UI reports opening then closing over the configured cycle; hold-open release reports a matching close.
+- Dashboard door status panel mirrors the Doors page for double gates (per-lane Open/Stop/Close plus Hold-Open / Release Both).
+
+Timezone:
+- The Settings page (`settings.timezone`) is the authoritative timezone. `config.php` is only a fallback before that row exists. Log timestamps are stored in local time; the API no longer re-converts them.
 
 ### Version 0.4.3 (August 2026)
 **Dependency security updates** — clears every open advisory in the React SPA toolchain (`npm audit`: 0 vulnerabilities). No application code changed; the pre-built SPA bundle was rebuilt against the patched dependencies.

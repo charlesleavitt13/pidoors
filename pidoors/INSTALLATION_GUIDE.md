@@ -12,14 +12,20 @@ Complete step-by-step instructions for setting up the PiDoors Access Control Sys
 4. [Part 3: Installing Door Controllers](#part-3-installing-door-controllers)
 5. [Part 4: Reader Wiring Guides](#part-4-reader-wiring-guides)
    - [Wiegand Readers](#wiegand-readers)
+   - [Keypad PIN access](#keypad-pin-access-wiegand-keypads)
    - [OSDP RS-485 Readers](#osdp-rs-485-readers)
    - [NFC PN532 Readers](#nfc-pn532-readers)
    - [NFC MFRC522 Readers](#nfc-mfrc522-readers)
 6. [Part 5: First Login and Configuration](#part-5-first-login-and-configuration)
 7. [Part 6: Adding Your First Door and Card](#part-6-adding-your-first-door-and-card)
 8. [Part 7: Advanced Features](#part-7-advanced-features)
+   - [Gate Mode](#gate-mode-rollingsliding-gates)
+   - [Double gate mode](#double-gate-mode)
+   - [Soft Open Cycle](#soft-open-cycle)
+   - [Scheduled Hold-Open](#scheduled-hold-open)
 9. [Troubleshooting](#troubleshooting)
 10. [Maintenance](#maintenance)
+    - [Uninstall](#uninstall)
 11. [Upgrading](#upgrading)
 
 ---
@@ -55,7 +61,7 @@ Complete step-by-step instructions for setting up the PiDoors Access Control Sys
 
 | Reader Type | Interface | Formats | Cost | Notes |
 |-------------|-----------|---------|------|-------|
-| **Wiegand** | GPIO | 26/32/34/35/36/37/48-bit | $15-50 | Most common, easy setup |
+| **Wiegand** | GPIO | 26/32/34/35/36/37/48-bit | $15-50 | Most common, easy setup. Keypads (4-digit PIN + `#`) supported |
 | **OSDP** | RS-485 | Any | $50-150 | Encrypted, commercial-grade |
 | **PN532 NFC** | I2C or SPI | Mifare, NTAG | $10-20 | Reads NFC cards/tags |
 | **MFRC522 NFC** | SPI | Mifare | $5-10 | Low-cost NFC option |
@@ -197,9 +203,13 @@ sudo ./install.sh
    - Enter a username, email address, and strong password for the admin account — **write these down**
    - You can log in with either the username or email
 
-   The installer also generates TLS certificates for encrypted database connections and configures MariaDB to use them. Door controllers will download the CA certificate automatically during their installation.
+   The installer generates TLS certificates (with CA and server extensions) and configures MariaDB for one-way encrypted connections. Door controllers download the CA certificate and enroll with an **enrollment token** during their installation.
 
-4. **Wait for completion**. You'll see a success message with the web interface URL.
+4. **Wait for completion**. You'll see a success message with:
+   - The web interface URL (`https://your-pi-ip/`)
+   - The **controller enrollment token**
+
+   **Write down the enrollment token.** You will need it when installing door controllers on other Raspberry Pis. It is also stored in `/var/www/pidoors/includes/config.php` as `enrollment_token`. On a same-machine "Full" install (server + door), the token is reused automatically.
 
 ### Step 2.3: Configure the Application
 
@@ -298,6 +308,7 @@ sudo ./install.sh
 4. **Follow the prompts**:
    - Database server IP: Enter your server Pi's IP (e.g., `192.168.1.100`)
    - Database password: Enter the PiDoors database password
+   - **Enrollment token**: Paste the token printed at the end of the server install (from `/var/www/pidoors/includes/config.php` on the server). Same-machine full installs skip this prompt.
    - Door name: Give this door a short name, lowercase with underscores (e.g., `front_door`, `back_gate`)
    - **Reader type**: Select your card reader type:
      - **1) Wiegand** - Standard GPIO card readers (most common)
@@ -305,7 +316,7 @@ sudo ./install.sh
      - **3) NFC PN532** - PN532 NFC reader via I2C
      - **4) NFC MFRC522** - MFRC522 NFC reader via SPI
 
-   The installer automatically downloads the TLS certificate from the server to encrypt database connections. If the server hasn't been updated to v2.6.0+ yet, the controller will still work with unencrypted connections.
+   The installer downloads the CA certificate from the server and uses the enrollment token to sign this controller's TLS certificate. Encrypted database connections are required — there is no plaintext fallback.
 
 ### Step 3.3: Enable Required Interfaces
 
@@ -382,15 +393,45 @@ Connect your electric lock to the relay's NO (Normally Open) and COM terminals w
         "d0": 24,
         "d1": 23,
         "wiegand_format": "auto",
+        "keypad_enabled": false,
+        "keypad_pin_timeout_seconds": 15,
         "latch_gpio": 18,
         ...
     }
 }
 ```
 
+#### Keypad PIN access (Wiegand keypads)
+
+PiDoors can authorize 4-digit PINs from Wiegand keypads (tested with the Retekess T-AC04 four-bit-per-key protocol). Enable it in the door's configuration block:
+
+```json
+"keypad_enabled": true,
+"keypad_pin_timeout_seconds": 15
+```
+
+Then restart the controller:
+
+```bash
+sudo systemctl restart pidoors
+```
+
+**How to use it:**
+1. Enter up to four digits (`0`–`9`). Digits time out after `keypad_pin_timeout_seconds` (default 15) if you pause too long.
+2. Press `#` to submit. `*` is ignored (reserved for other keypad modes).
+3. The PIN is matched against the cardholder's **Card ID / PIN** field in the web UI — there is no separate PIN field.
+
+**Requirements and limits:**
+- PIN access is **online-only**. If the controller cannot reach the database, the PIN is refused ("PIN access unavailable").
+- **Card ID / PIN** must be unique. If two cards share the same value, the PIN is refused rather than granted to an arbitrary cardholder.
+- Facility code, door list, schedule, holiday, validity dates, and daily scan limits apply the same as a card scan.
+- A longer entry than four digits is rejected as "PIN entry too long".
+
+Assign a PIN when adding a card: set **Card ID / PIN** to the digits people will type, and still fill in **User ID** (the employee/person identifier). The same card can have a Wiegand card number *or* a keypad PIN as its Card ID; they occupy the same field.
+
 #### Diagnosing an undocumented Wiegand keypad
 
-PiDoors does not authorize keypad PINs until the reader's keypress protocol is identified. To capture the Retekess T-AC04's key frames, add these settings inside the door's configuration block:
+If PIN entry does nothing, the keypad may use a different keypress protocol. To capture raw frames, add these settings inside the door's configuration block:
 
 ```json
 "keypad_diagnostic_capture": true,
@@ -405,8 +446,6 @@ sudo journalctl -u pidoors -f
 ```
 
 The journal will show the unsupported frame length and raw bits for each press. Raw frames can reveal entered digits, so run this only during a controlled test, do not enter real PINs, and set `keypad_diagnostic_capture` back to `false` when finished. This diagnostic mode does not unlock doors or attempt PIN validation.
-
-When keypad PIN access is enabled, enter up to four digits and press `#` to submit. The `*` key is ignored so it remains available for reader-specific keypad modes. The entered value is matched against the cardholder's existing **Card ID / PIN** field, so no separate PIN field is required. PIN attempts are recorded only in access logging; PiDoors never records the literal PIN.
 
 ---
 
@@ -586,7 +625,7 @@ Press `Ctrl + C` to stop viewing logs.
 
 2. **Configure basic settings**:
    - System Name: Give your system a name
-   - Timezone: Set your timezone
+   - Timezone: Set your timezone. This Settings-page value is authoritative for the whole system (`config.php` is only a fallback before this row exists). Access log timestamps are stored in this local time.
    - Session Timeout: 3600 seconds (1 hour) is recommended
 
 3. **Configure Email Notifications** (optional):
@@ -646,9 +685,9 @@ Access denied: Card not in database
 1. **In the web interface**, go to **"Cards"**
 2. **Click "Add Card"**
 3. **Fill in the form**:
-   - Card ID: The number you wrote down (e.g., 12345678)
-   - User ID: A unique identifier (e.g., EMP001, JOHN001)
-   - Facility Code: The facility code from the reader
+   - **Card ID / PIN**: The number you wrote down (e.g., 12345678). For keypad access, this is also the PIN people type on the reader. The value must be unique.
+   - **User ID**: A unique identifier for the person (e.g., EMP001, JOHN001)
+   - Facility Code: The facility code from the reader (required for Wiegand card scans)
    - First Name / Last Name: Card holder's name
    - Door Access: Select which doors this card can open
    - Access Group: Leave blank for now (full access)
@@ -719,7 +758,8 @@ PiDoors supports **gate motor controllers** in addition to electronic door locks
 1. **Go to "Doors"** in the web UI
 2. **Click the edit (pencil) icon** on the door you want to convert
 3. **Check the "Gate mode" box**
-4. **Configure the I/O** under "Gate I/O Configuration":
+4. Optionally check **Double gate mode** if you have a separate inbound and outbound gate (see below)
+5. **Configure the I/O** under "Gate I/O Configuration":
 
    **Inputs (physical buttons or RF remote relays):**
    - **Open button** — Triggers the open output. Triple-tap = enter hold-open state.
@@ -731,23 +771,64 @@ PiDoors supports **gate motor controllers** in addition to electronic door locks
    - **Stop relay** — Optional, fires when stop is triggered (only needed if your motor has a dedicated stop input)
    - **Close relay** — Held active for the configured duration to close the gate
 
-5. **Each input/output is optional** — only enable what your hardware supports. Pin numbers, polarity (active high/low), and (for outputs) hold duration are configurable per input/output.
+6. **Each input/output is optional** — only enable what your hardware supports. Pin numbers, polarity (active high/low), and (for outputs) hold duration are configurable per input/output.
 
-6. **Save**. The controller will reload its config and switch to gate mode.
+7. **Save**. The controller will reload its config and switch to gate mode.
 
-**Hold duration:** Each output relay has its own configurable hold time (default 30 seconds). This is how long the relay stays active to drive the gate motor.
+**Hold duration:** Each output relay has its own configurable hold time (default 30 seconds). This is how long the relay stays active to drive the gate motor (or, with Soft Open Cycle, the length of the trigger pulse).
 
 **Polarity:** "Active high" = relay engages when GPIO is at 3.3V. "Active low" = relay engages when GPIO is at GND. Most relay modules with optocouplers are active low.
 
 **Pin conflicts:** The web UI shows only available GPIO pins (excluding ones used by your reader, sensor, status LED, and other gate I/O). The system prevents double-assignment.
 
-**Card scans on a gate:** A successful card scan triggers the open output (just like a card scan unlocks a door). Master card 3-scan enters the hold-open state. A single master scan releases any hold state.
+**Card scans on a gate:** A successful card scan triggers the open output (just like a card scan unlocks a door). In double-gate mode, a card scan opens the **inbound** lane only. Master card 3-scan enters the hold-open state (both lanes in double-gate mode). A single master scan releases any hold state.
 
-**Web UI control:** When a door is in gate mode, the door card on the Doors page shows dedicated **Open / Stop / Close / Hold / Release** buttons and a live state badge (idle / opening / closing / stopped / open / closed / held).
+**Web UI control:** When a door is in gate mode, the door card on the Doors page (and the dashboard status panel) shows dedicated **Open / Stop / Close / Hold / Release** buttons and a live state badge (idle / opening / closing / stopped / open / closed / held). Double gates show inbound and outbound lanes separately.
 
 **Wiring:** Wire each output relay's NO/COM terminals to the corresponding input on your gate motor controller. Wire each input button between the assigned GPIO pin and GND (default pull-up mode). For dry-contact switches no level shifter is needed; for 5V signals (like RF remote relay outputs) use a bi-directional logic level shifter.
 
 **Status persistence:** The current gate state and hold flag are saved to the database and restored on controller restart, so a power cycle won't accidentally release a held gate.
+
+#### Double gate mode
+
+Use this when two independent gates (or two leaves) serve inbound and outbound traffic.
+
+1. Edit the door, enable **Gate mode**, then check **Double gate mode**
+2. Configure **Inbound** and **Outbound** open/stop/close inputs and outputs separately
+3. Save
+
+Behavior:
+- Card scans and REX open the **inbound** gate only
+- Dashboard **Close** defaults to the **outbound** gate
+- **Hold-Open** opens and holds **both** lanes until you click **Release Both**
+- Each lane reports its own state (idle / opening / closing / stopped / open / closed)
+- Both inbound and outbound **Open** outputs must be configured for hold-open to work
+
+#### Soft Open Cycle
+
+Enable this on an **Open** relay when the gate opener — not PiDoors — runs its own open/close timing after a short trigger pulse.
+
+1. Enable the Open relay and set **Hold (sec)** to the pulse length the opener expects
+2. Check **Soft Open Cycle**
+3. Set **Open Cycle Duration** to how long the opener takes to open and close (1–600 seconds, default 30)
+
+PiDoors then reports **opening** for half the cycle, **closing** for the second half, then **closed**. No extra GPIO is driven after the trigger pulse. After a hold-open is released, the opener closes itself when the hold input drops; PiDoors reports closing for half the cycle, then closed.
+
+### Scheduled Hold-Open
+
+Any door or gate can stay unlocked during a schedule you already created.
+
+1. **Go to "Schedules"** and create (or reuse) a schedule — for example "Business Hours"
+2. **Go to "Doors"** and edit the door
+3. Set **Hold Open Schedule** to that schedule
+4. Save
+
+The controller checks the schedule every 15 seconds (independently of heartbeat):
+- While the schedule is active, a regular door is held unlocked; a gate is held open (both lanes in double-gate mode)
+- When the window ends, the hold is released. Gates are **not** forced closed
+- A manual **Release** (or master-card release) suppresses scheduled hold-open until the next schedule period starts
+
+This is separate from a card's access schedule. A card schedule controls *when that card may enter*; a hold-open schedule controls *when the door itself stays open*.
 
 ### Status LED (Optional)
 
@@ -765,6 +846,8 @@ c3d4e5f6,EMP003,123,Bob,Wilson,front-door,1,bob@example.com,Operations
 ```
 
 Required: `card_id` and `user_id`. Needed to grant access: `facility` (must match the reader facility code) and `doors` (comma-separated door names, or `*` for all doors). If `doors` is empty and `group_id` is set (or you pick a default access group in the import form), that group's door list is copied onto the card. Optional: `firstname`, `lastname`, `active`, `email`, `phone`, `department`, `employee_id`, `company`, `title`, `notes`, `group_id`, `schedule_id`, `valid_from`, `valid_until`, `daily_scan_limit`, `master`. Keypad PIN is stored in `card_id`; a `pin_code` column is ignored.
+
+Export CSV uses the same columns, so a round-trip re-import keeps door access and active status.
 
 2. **Go to "Import CSV"** (from the Cards page)
 3. **Upload your CSV file**
@@ -816,6 +899,20 @@ sudo ufw allow 443/tcp
 sudo tail -50 /var/log/nginx/pidoors_error.log
 ```
 
+### Problem: Door controller install fails at certificate signing
+
+**Solution 1: Check the enrollment token**
+The token is printed at the end of the server install and stored in `/var/www/pidoors/includes/config.php` as `enrollment_token`. Paste it exactly when the door installer asks. Same-machine full installs should not need this prompt.
+
+**Solution 2: Confirm the server is reachable over HTTPS**
+```bash
+curl -k https://YOUR_SERVER_IP/api/certs/sign
+```
+You should get a JSON error about missing fields, not a connection failure.
+
+**Solution 3: Confirm MariaDB TLS on the server**
+The controller requires an encrypted database connection (no plaintext fallback). On the server, `/etc/mysql/mariadb.conf.d/50-server.cnf` should set `ssl-cert` and `ssl-key` (not `ssl-ca` — PiDoors uses one-way TLS). The CA cert is trusted locally on the controller as `/opt/pidoors/conf/ca.pem`.
+
 ### Problem: Door controller shows "offline" in web interface
 
 **Solution 1: Check if service is running**
@@ -847,6 +944,29 @@ cat /opt/pidoors/conf/config.json
 ```
 
 Verify the server IP and database password are correct.
+
+### Problem: Keypad PIN not working
+
+**Solution 1: Enable keypad in the controller config**
+```bash
+sudo nano /opt/pidoors/conf/config.json
+```
+Set `"keypad_enabled": true` inside the door block, then:
+```bash
+sudo systemctl restart pidoors
+```
+
+**Solution 2: Confirm the PIN is the Card ID**
+In the web UI, **Cards** > edit the card. The **Card ID / PIN** field must be exactly the digits typed on the keypad (up to four digits). There is no separate PIN field.
+
+**Solution 3: Check that the PIN is unique**
+If two cards share the same Card ID, PIN access is refused. Each Card ID / PIN must be unique.
+
+**Solution 4: PIN access needs the database**
+Keypad PINs are authorized online. If the controller is offline from the server, PIN entry is refused. Card scans can still work from the 24-hour cache.
+
+**Solution 5: Capture the keypad protocol**
+If nothing appears in the logs when you press keys, see [Diagnosing an undocumented Wiegand keypad](#diagnosing-an-undocumented-wiegand-keypad).
 
 ### Problem: Card not working
 
@@ -1052,6 +1172,23 @@ sudo nano /var/www/pidoors/includes/config.php
 
 ## Maintenance
 
+### Uninstall
+
+To remove PiDoors from a machine:
+
+```bash
+cd ~/pidoors
+sudo ./uninstall.sh
+```
+
+Choose **1) Server**, **2) Door Controller**, or **3) Both**. For a server uninstall you can:
+
+1. Keep the database (reinstall on top)
+2. Backup then wipe (recommended for a clean reinstall) — backup is written to `/var/backups/pidoors/`
+3. Wipe without backup (type `yes` to confirm)
+
+The script stops services, removes web files, nginx/PHP config, the controller under `/opt/pidoors`, TLS certificates, firewall rules, and the `pidoors` user. Type `yes` at the final prompt to proceed.
+
 ### Daily Backups (Automatic)
 
 Backups run automatically (if configured) to `/var/backups/pidoors/`
@@ -1190,7 +1327,11 @@ No manual configuration is needed. If you need to regenerate the certificate (e.
 sudo openssl genrsa 2048 > /etc/ssl/private/pidoors.key
 SERVER_IP=$(hostname -I | awk '{print $1}')
 sudo openssl req -new -key /etc/ssl/private/pidoors.key -out /tmp/pidoors.csr -subj "/CN=PiDoors Web"
-echo "subjectAltName = IP:${SERVER_IP},DNS:pidoors,DNS:pidoors.local,DNS:localhost,IP:127.0.0.1" > /tmp/pidoors-ext.cnf
+cat > /tmp/pidoors-ext.cnf <<EOF
+subjectAltName = IP:${SERVER_IP},DNS:pidoors,DNS:pidoors.local,DNS:localhost,IP:127.0.0.1
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+EOF
 sudo openssl x509 -req -days 3650 -in /tmp/pidoors.csr -CA /etc/mysql/ssl/ca.pem -CAkey /etc/mysql/ssl/ca-key.pem -CAcreateserial -out /etc/ssl/certs/pidoors.crt -extfile /tmp/pidoors-ext.cnf
 rm -f /tmp/pidoors.csr /tmp/pidoors-ext.cnf
 sudo nginx -t && sudo systemctl reload nginx
@@ -1269,6 +1410,7 @@ sudo /opt/pidoors/venv/bin/pip install rpi-lgpio -q
 
 | Version | Date | Migration Required | Notes |
 |---------|------|-------------------|-------|
+| Unreleased | Aug 2026 | **Yes** - `database_migration.sql` (adds `hold_open_schedule_id`, `gate_inbound_state`, `gate_outbound_state`) | Enrollment token in installer, `uninstall.sh`, keypad PIN, double gate mode, scheduled hold-open, soft open cycle, timezone from Settings |
 | v3.1.5 | Mar 2026 | No | Fix updater deleting ca.pem, auto-restore CA cert on update |
 | v3.1.4 | Mar 2026 | No | Fix false offline status when push fails, better install diagnostics |
 | v3.1.3 | Mar 2026 | No | Fix CA key permissions for cert signing, UI improvements |
