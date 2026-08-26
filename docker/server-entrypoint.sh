@@ -341,6 +341,8 @@ ln -sfn "$CERT_DIR" /etc/mysql/ssl
 log "Deploying web files..."
 cp -r /src/pidoorserv/* "$WEB_ROOT/"
 [ -f /src/VERSION ] && cp /src/VERSION "$WEB_ROOT/"
+[ -f /src/GITHUB_REPO ] && cp /src/GITHUB_REPO "$WEB_ROOT/"
+[ -f /src/database_migration.sql ] && cp /src/database_migration.sql "$WEB_ROOT/"
 
 # Copy CA cert to web root for door controllers (mirrors install.sh lines 417–420)
 if [ -f "$CERT_DIR/ca.pem" ]; then

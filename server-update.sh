@@ -15,8 +15,15 @@
 
 set -euo pipefail
 
-REPO="sybethiesant/pidoors"
 WEB_ROOT="/var/www/pidoors"
+# Prefer the GITHUB_REPO file from this checkout, then the installed web root.
+if [ -f "$(cd "$(dirname "$0")" && pwd)/GITHUB_REPO" ]; then
+    REPO=$(tr -d '[:space:]' < "$(cd "$(dirname "$0")" && pwd)/GITHUB_REPO")
+elif [ -f "$WEB_ROOT/GITHUB_REPO" ]; then
+    REPO=$(tr -d '[:space:]' < "$WEB_ROOT/GITHUB_REPO")
+else
+    REPO="charlesleavitt13/pidoors"
+fi
 BACKUP_DIR="/var/backups/pidoors"
 TMPDIR=""
 
@@ -287,6 +294,14 @@ fi
 cp "$EXTRACTED/VERSION" "$WEB_ROOT/VERSION"
 ok "VERSION file updated"
 
+if [ -f "$EXTRACTED/GITHUB_REPO" ]; then
+    cp "$EXTRACTED/GITHUB_REPO" "$WEB_ROOT/GITHUB_REPO"
+fi
+mkdir -p "$WEB_ROOT/nginx"
+if [ -f "$EXTRACTED/nginx/pidoors.conf" ]; then
+    cp "$EXTRACTED/nginx/pidoors.conf" "$WEB_ROOT/nginx/pidoors.conf"
+fi
+
 # Copy database migration if present
 if [ -f "$EXTRACTED/database_migration.sql" ]; then
     cp "$EXTRACTED/database_migration.sql" "$WEB_ROOT/database_migration.sql"
@@ -430,9 +445,47 @@ UPGRADESH
     chmod 755 /usr/local/sbin/pidoors-nginx-upgrade
     cat > /etc/sudoers.d/pidoors-nginx <<'SUDOEOF'
 www-data ALL=(ALL) NOPASSWD: /usr/local/sbin/pidoors-nginx-upgrade
+www-data ALL=(ALL) NOPASSWD: /usr/local/sbin/pidoors-host-hygiene
 SUDOEOF
     chmod 440 /etc/sudoers.d/pidoors-nginx
     ok "Nginx upgrade helper installed"
+fi
+
+if [ ! -f /usr/local/sbin/pidoors-host-hygiene ]; then
+    cat > /usr/local/sbin/pidoors-host-hygiene <<'HYGIENESH'
+#!/bin/bash
+set -e
+if [ ! -f /proc/device-tree/model ] || ! grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
+    exit 0
+fi
+mkdir -p /etc/systemd/journald.conf.d
+if [ ! -f /etc/systemd/journald.conf.d/pidoors.conf ]; then
+    cat > /etc/systemd/journald.conf.d/pidoors.conf <<'JOURNALD'
+[Journal]
+Storage=persistent
+SystemMaxUse=50M
+SystemMaxFileSize=10M
+RuntimeMaxUse=20M
+MaxRetentionSec=14day
+Compress=yes
+JOURNALD
+    systemctl restart systemd-journald 2>/dev/null || true
+fi
+if [ -d /etc/mysql/mariadb.conf.d ] && [ ! -f /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf ]; then
+    cat > /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf <<'MARIACNF'
+[mysqld]
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+skip-log-bin
+MARIACNF
+    systemctl restart mariadb 2>/dev/null || true
+fi
+HYGIENESH
+    chmod 755 /usr/local/sbin/pidoors-host-hygiene
+    grep -q pidoors-host-hygiene /etc/sudoers.d/pidoors-nginx 2>/dev/null || \
+        echo 'www-data ALL=(ALL) NOPASSWD: /usr/local/sbin/pidoors-host-hygiene' >> /etc/sudoers.d/pidoors-nginx
+    chmod 440 /etc/sudoers.d/pidoors-nginx 2>/dev/null || true
+    ok "Host hygiene helper installed"
 fi
 
 # ──────────────────────────────────────────────

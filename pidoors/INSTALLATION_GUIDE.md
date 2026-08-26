@@ -165,14 +165,14 @@ cd ~
 3. **Download PiDoors** (requires internet connection):
 
 ```bash
-git clone https://github.com/sybethiesant/pidoors.git
+git clone https://github.com/charlesleavitt13/pidoors.git
 ```
 
 If you get an error that git isn't installed:
 
 ```bash
 sudo apt-get install git -y
-git clone https://github.com/sybethiesant/pidoors.git
+git clone https://github.com/charlesleavitt13/pidoors.git
 ```
 
 4. **Go into the PiDoors folder**:
@@ -293,7 +293,7 @@ sudo reboot
 
 ```bash
 cd ~
-git clone https://github.com/sybethiesant/pidoors.git
+git clone https://github.com/charlesleavitt13/pidoors.git
 cd pidoors
 ```
 
@@ -1540,7 +1540,7 @@ sudo /opt/pidoors/venv/bin/pip install rpi-lgpio -q
 
 | Version | Date | Migration Required | Notes |
 |---------|------|-------------------|-------|
-| Unreleased | Aug 2026 | **Yes** - `database_migration.sql` (adds `hold_open_schedule_id`, `gate_inbound_state`, `gate_outbound_state`) | Enrollment token in installer, `uninstall.sh`, keypad PIN, double gate mode, scheduled hold-open, soft open cycle, timezone from Settings |
+| v0.5.0 | Aug 2026 | **Yes** - `database_migration.sql` (adds `hold_open_schedule_id`, `gate_inbound_state`, `gate_outbound_state`) | Fork releases from charlesleavitt13/pidoors (`GITHUB_REPO`), keypad PIN, double gate mode, scheduled hold-open, soft open cycle, SD-card endurance, `uninstall.sh` |
 | v3.1.5 | Mar 2026 | No | Fix updater deleting ca.pem, auto-restore CA cert on update |
 | v3.1.4 | Mar 2026 | No | Fix false offline status when push fails, better install diagnostics |
 | v3.1.3 | Mar 2026 | No | Fix CA key permissions for cert signing, UI improvements |

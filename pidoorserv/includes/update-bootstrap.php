@@ -14,11 +14,11 @@
 function pidoors_bootstrap_update(array $config, PDO $pdo_access, PDO $pdo, string $target_version): array {
     $tag_with_v = 'v' . $target_version;
 
+    require_once __DIR__ . '/github.php';
+
     // Download URLs — try release asset first (has pre-built SPA), fall back to source archive
-    $tarball_urls = [
-        "https://github.com/sybethiesant/pidoors/releases/download/{$tag_with_v}/{$tag_with_v}.tar.gz",
-        "https://github.com/sybethiesant/pidoors/archive/refs/tags/{$tag_with_v}.tar.gz",
-    ];
+    $tarball_urls = pidoors_github_release_tarball_urls($tag_with_v, $config);
+    $checksum_url = pidoors_github_release_checksum_url($tag_with_v, $config);
 
     $tmpdir = sys_get_temp_dir() . '/pidoors-server-update-' . uniqid();
     if (!mkdir($tmpdir, 0700, true)) {
@@ -49,6 +49,32 @@ function pidoors_bootstrap_update(array $config, PDO $pdo_access, PDO $pdo, stri
     if ($http_code !== 200 || !file_exists($tarball) || filesize($tarball) < 1000) {
         @exec('rm -rf ' . escapeshellarg($tmpdir));
         return ['ok' => false, 'msg' => "Failed to download release tarball (HTTP $http_code).", 'details' => []];
+    }
+
+    // Verify SHA-256 against the published .sha256 asset (same as server-update.sh).
+    $sum_file = $tarball . '.sha256';
+    $sum_ch = curl_init($checksum_url);
+    $sum_fp = fopen($sum_file, 'w');
+    curl_setopt_array($sum_ch, [
+        CURLOPT_FILE => $sum_fp,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTPHEADER => ['User-Agent: PiDoors-Update'],
+    ]);
+    curl_exec($sum_ch);
+    $sum_code = curl_getinfo($sum_ch, CURLINFO_HTTP_CODE);
+    curl_close($sum_ch);
+    fclose($sum_fp);
+    if ($sum_code !== 200 || !file_exists($sum_file) || filesize($sum_file) < 16) {
+        @exec('rm -rf ' . escapeshellarg($tmpdir));
+        return ['ok' => false, 'msg' => "Failed to download release checksum (HTTP $sum_code).", 'details' => []];
+    }
+    $sum_line = trim((string)file_get_contents($sum_file));
+    $expected = strtolower(strtok($sum_line, " \t"));
+    $actual = strtolower(hash_file('sha256', $tarball) ?: '');
+    if (!preg_match('/^[a-f0-9]{64}$/', $expected) || !hash_equals($expected, $actual)) {
+        @exec('rm -rf ' . escapeshellarg($tmpdir));
+        return ['ok' => false, 'msg' => 'Release checksum mismatch — aborting update.', 'details' => []];
     }
 
     // Extract

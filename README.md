@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/license-Open%20Source-blue)
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi-red)
-![Version](https://img.shields.io/badge/version-0.4.3-green)
+![Version](https://img.shields.io/badge/version-0.5.0-green)
 ![Status](https://img.shields.io/badge/status-Production%20Ready-brightgreen)
 
 **Professional-grade physical access control powered by Raspberry Pi**
@@ -12,6 +12,8 @@
 ## Overview
 
 PiDoors is a complete, industrial-grade access control system built on Raspberry Pi hardware. It provides enterprise-level security features while remaining affordable and open source. Designed for small businesses, makerspaces, office buildings, or anyone needing professional access control.
+
+This repository is a fork of [sybethiesant/pidoors](https://github.com/sybethiesant/pidoors). Installs and in-app updates use `GITHUB_REPO` (`charlesleavitt13/pidoors`).
 
 **Key Benefits:**
 - **Cost-Effective**: 10x cheaper than commercial systems (~$100-150 per door vs $500-2000)
@@ -143,7 +145,7 @@ PiDoors is a complete, industrial-grade access control system built on Raspberry
 
 ```bash
 # Download PiDoors
-git clone https://github.com/sybethiesant/pidoors.git
+git clone https://github.com/charlesleavitt13/pidoors.git
 cd pidoors
 
 # Run installer as root
@@ -755,7 +757,7 @@ Contributions welcome! Please:
 
 ## Roadmap
 
-**Current Version: 0.4.3** - Pre-release
+**Current Version: 0.5.0** - Pre-release (fork: charlesleavitt13/pidoors)
 
 **Future Enhancements** (community contributions welcome):
 - Mobile app (iOS/Android)
@@ -770,8 +772,14 @@ Contributions welcome! Please:
 
 > **Note:** Version numbering was reset from 3.x to 0.x in April 2026. The project had rapidly iterated from v1.0 to v3.2 during initial development. The 0.x series reflects pre-release status as the system matures toward a proper v1.0.0 release.
 
-### Unreleased (August 2026)
-**Installer, keypad PIN, double gates, scheduled hold-open, and soft open cycle.**
+### Version 0.5.0 (August 2026)
+**Installer, keypad PIN, double gates, scheduled hold-open, soft open cycle, and SD-card endurance.**
+
+Releases and in-app updates now track `GITHUB_REPO` (`charlesleavitt13/pidoors`) instead of the upstream `sybethiesant/pidoors` repository.
+
+SD-card endurance:
+- Controller: append-only local logs, skip no-op cache/master fsyncs, skip unchanged command-poll SQL commits.
+- Server: nginx `/api/` access log off, PHP session write debounce, `log_retention_days` actually enforced, Raspberry Pi journald cap and MariaDB `innodb_flush_log_at_trx_commit=2`.
 
 Installer:
 - Fresh `sudo ./install.sh` now completes end-to-end: MariaDB TLS certs include CA and server X.509 extensions, MariaDB is configured for **one-way TLS** (no `ssl-ca` in the server chain), and `sql_ssl_ca` is written into the PHP config.
@@ -933,8 +941,8 @@ This project is open source and available for free use, modification, and distri
 ## Support
 
 - **Documentation**: [Installation Guide](pidoors/INSTALLATION_GUIDE.md)
-- **Bug Reports**: [GitHub Issues](https://github.com/sybethiesant/pidoors/issues)
-- **Feature Requests**: [GitHub Issues](https://github.com/sybethiesant/pidoors/issues)
+- **Bug Reports**: [GitHub Issues](https://github.com/charlesleavitt13/pidoors/issues)
+- **Feature Requests**: [GitHub Issues](https://github.com/charlesleavitt13/pidoors/issues)
 
 ---
 
