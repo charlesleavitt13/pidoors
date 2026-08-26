@@ -302,7 +302,7 @@ $timezones = DateTimeZone::listIdentifiers();
                         <label for="log_retention_days" class="form-label">Log Retention (days)</label>
                         <input type="number" class="form-control" id="log_retention_days" name="log_retention_days"
                                min="30" max="3650" value="<?php echo htmlspecialchars($settings['log_retention_days']); ?>">
-                        <div class="form-text">How long to keep access logs before automatic cleanup (30 days - 10 years).</div>
+                        <div class="form-text">How long to keep access logs before automatic cleanup (30 days - 10 years). Cleanup runs from the notify cron every 5 minutes.</div>
                     </div>
                 </div>
             </div>

@@ -357,6 +357,9 @@ if [ -f /etc/nginx/sites-available/pidoors ] && [ -f "$EXTRACTED/nginx/pidoors.c
     elif ! grep -q "location = /index.html" /etc/nginx/sites-available/pidoors 2>/dev/null; then
         NEEDS_UPGRADE=true
         info "Upgrading Nginx config: missing index.html no-cache block"
+    elif ! grep -q "access_log off" /etc/nginx/sites-available/pidoors 2>/dev/null; then
+        NEEDS_UPGRADE=true
+        info "Upgrading Nginx config: API access log still enabled"
     fi
     if [ "$NEEDS_UPGRADE" = true ]; then
         PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;" 2>/dev/null || echo "")
@@ -367,6 +370,35 @@ if [ -f /etc/nginx/sites-available/pidoors ] && [ -f "$EXTRACTED/nginx/pidoors.c
             cp "$EXTRACTED/nginx/pidoors.conf" /etc/nginx/sites-available/pidoors
         fi
         ok "Nginx config upgraded"
+    fi
+fi
+
+# Raspberry Pi SD-card hygiene for existing servers (idempotent)
+if [ -f /proc/device-tree/model ] && grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
+    mkdir -p /etc/systemd/journald.conf.d
+    if [ ! -f /etc/systemd/journald.conf.d/pidoors.conf ]; then
+        cat > /etc/systemd/journald.conf.d/pidoors.conf <<'JOURNALD'
+[Journal]
+Storage=persistent
+SystemMaxUse=50M
+SystemMaxFileSize=10M
+RuntimeMaxUse=20M
+MaxRetentionSec=14day
+Compress=yes
+JOURNALD
+        systemctl restart systemd-journald 2>/dev/null || true
+        ok "journald capped at 50M"
+    fi
+    if [ ! -f /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf ]; then
+        mkdir -p /etc/mysql/mariadb.conf.d
+        cat > /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf <<'MARIACNF'
+[mysqld]
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+skip-log-bin
+MARIACNF
+        systemctl restart mariadb 2>/dev/null || true
+        ok "MariaDB SD-card flush settings installed"
     fi
 fi
 

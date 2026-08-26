@@ -272,6 +272,21 @@ if [ -f "$MARIADB_CNF" ] && grep -q "^bind-address\s*=\s*127.0.0.1" "$MARIADB_CN
     NEED_MARIADB_RESTART=true
 fi
 
+# Raspberry Pi SD-card hygiene (same drop-in as install.sh). Skip on x86/VM.
+if [ -f /proc/device-tree/model ] && grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
+    if [ ! -f /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf ]; then
+        mkdir -p /etc/mysql/mariadb.conf.d
+        cat > /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf <<'MARIACNF'
+[mysqld]
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+skip-log-bin
+MARIACNF
+        NEED_MARIADB_RESTART=true
+        log "MariaDB SD-card flush settings installed"
+    fi
+fi
+
 if [ "$NEED_MARIADB_RESTART" = true ]; then
     log "Restarting MariaDB with TLS and remote access..."
     mysqladmin -u root -p"$DB_ROOT_PASS" shutdown 2>/dev/null || true

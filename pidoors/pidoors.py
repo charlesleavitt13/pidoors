@@ -94,6 +94,15 @@ DB_RETRY_INTERVAL = 30  # seconds
 # induces a prolonged outage cannot keep using a card that was meant to be
 # revoked. Explicit revocations (seen while online) take effect immediately.
 MASTER_CARD_MAX_STALE_DAYS = 7
+# Persist the access cache even when card/schedule content is unchanged at least
+# this often, so a reboot still sees a fresh sync_time inside CACHE_DURATION.
+# Content changes always persist immediately.
+CACHE_UNCHANGED_PERSIST_SECONDS = 43200  # 12 hours
+# last_verified is updated in memory on every online master-card check, but the
+# file is fsynced at most this often (or immediately on membership add/remove).
+MASTER_CARD_PERSIST_INTERVAL = 86400  # 24 hours
+ACCESS_LOG_MAX_ENTRIES = 1000
+DOOR_EVENTS_MAX_ENTRIES = 500
 
 # Global variables
 zone = None
@@ -155,6 +164,16 @@ card_lock = threading.Lock()   # For last_card, repeat_read_count, repeat_read_t
 master_lock = threading.Lock() # For master_cards access
 wiegand_lock = threading.Lock() # For legacy Wiegand stream access
 gate_lock = threading.Lock()   # For gate state mutations
+
+# Durable-write coalescing (SD-card wear). Content identity of the last fsynced
+# cache / master-cards file, and the last lock state pushed by command poll.
+_last_saved_cache_key = None
+_last_saved_cache_disk_time = 0
+_master_persisted_keys = None
+_master_persisted_at = 0
+_ndjson_line_counts = {}  # path -> approximate entry count
+_last_poll_locked = None
+_last_poll_held = None
 
 
 def _try_db_connect(kwargs):
@@ -421,9 +440,22 @@ def get_cache_file():
     return os.path.join(CACHE_DIR, f"{zone}_access_cache.json")
 
 
+def _cache_content_key(cache):
+    """Stable fingerprint of cache payload excluding sync timestamps."""
+    subset = {
+        'cards': cache.get('cards'),
+        'schedules': cache.get('schedules'),
+        'holidays': cache.get('holidays'),
+        'door_settings': cache.get('door_settings'),
+        'settings': cache.get('settings'),
+    }
+    return json.dumps(subset, sort_keys=True, default=str)
+
+
 def load_cache():
     """Load the local access cache from disk"""
     global local_cache, cache_last_sync
+    global _last_saved_cache_key, _last_saved_cache_disk_time
     cache_file = get_cache_file()
 
     try:
@@ -439,6 +471,9 @@ def load_cache():
                     # Legacy format: full cache nested under 'cards' key
                     local_cache = cache_data.get('cards', {})
 
+                _last_saved_cache_key = _cache_content_key(local_cache)
+                _last_saved_cache_disk_time = cache_last_sync or 0
+
                 # Check if cache is still valid (within 24 hours)
                 if time.time() - cache_last_sync > CACHE_DURATION:
                     report("Local cache expired (>24 hours old)")
@@ -452,19 +487,35 @@ def load_cache():
 
 
 def save_cache():
-    """Save the local access cache to disk"""
-    global cache_last_sync
+    """Save the local access cache to disk.
+
+    Always updates cache_last_sync in memory. Skips the fsync when the
+    cards/schedules/holidays/door_settings/settings payload is unchanged and
+    the last durable write is still within CACHE_UNCHANGED_PERSIST_SECONDS,
+    so a reboot still sees a sync_time inside the 24-hour validity window.
+    """
+    global cache_last_sync, _last_saved_cache_key, _last_saved_cache_disk_time
     cache_file = get_cache_file()
 
     try:
+        now = time.time()
+        cache_last_sync = now
+        key = _cache_content_key(local_cache)
+        if (key == _last_saved_cache_key
+                and _last_saved_cache_disk_time
+                and (now - _last_saved_cache_disk_time) < CACHE_UNCHANGED_PERSIST_SECONDS):
+            debug("Cache content unchanged; skipping durable write")
+            return
+
         # Save local_cache structure (cards, schedules, holidays, door_settings)
         # with metadata at the same level
         cache_data = dict(local_cache)
         cache_data['zone'] = zone
-        cache_data['sync_time'] = time.time()
+        cache_data['sync_time'] = now
         cache_data['sync_datetime'] = datetime.now().isoformat()
         save_json(cache_file, cache_data)
-        cache_last_sync = cache_data['sync_time']
+        _last_saved_cache_key = key
+        _last_saved_cache_disk_time = now
         debug(f"Cache saved with {len(local_cache.get('cards', {}))} cards")
     except Exception as e:
         report(f"Error saving cache: {e}")
@@ -479,7 +530,7 @@ def load_master_cards():
     Load master cards from persistent storage.
     Master cards never expire - they are used for emergency access.
     """
-    global master_cards
+    global master_cards, _master_persisted_keys, _master_persisted_at
 
     try:
         # Migrate from old location (conf/) to new location (cache/) if needed
@@ -496,6 +547,8 @@ def load_master_cards():
                 data = json.load(f)
                 with master_lock:
                     master_cards = data.get('cards', {})
+                _master_persisted_keys = frozenset(master_cards.keys())
+                _master_persisted_at = time.time()
                 card_count = len(master_cards)
                 if card_count > 0:
                     report(f"Loaded {card_count} master cards from persistent storage")
@@ -505,16 +558,32 @@ def load_master_cards():
             master_cards = {}
 
 
-def save_master_cards():
-    """Save master cards to persistent storage"""
+def save_master_cards(force=False):
+    """Save master cards to persistent storage.
+
+    Membership add/remove should pass force=True. last_verified refreshes
+    are coalesced to at most once per MASTER_CARD_PERSIST_INTERVAL so a
+    busy master-card scan path does not fsync the SD card on every badge.
+    """
+    global _master_persisted_keys, _master_persisted_at
     try:
         with master_lock:
             data = {
                 'last_sync': datetime.now().isoformat(),
                 'cards': dict(master_cards)
             }
+            keys = frozenset(master_cards.keys())
+        now = time.time()
+        if (not force
+                and _master_persisted_keys == keys
+                and _master_persisted_at
+                and (now - _master_persisted_at) < MASTER_CARD_PERSIST_INTERVAL):
+            debug("Master cards unchanged; skipping durable write")
+            return
         save_json(MASTER_CARDS_FILE, data)
-        debug(f"Master cards saved: {len(master_cards)} cards")
+        _master_persisted_keys = keys
+        _master_persisted_at = now
+        debug(f"Master cards saved: {len(data['cards'])} cards")
     except Exception as e:
         report(f"Error saving master cards: {e}")
 
@@ -561,7 +630,7 @@ def sync_master_cards_from_db(cursor):
 
             master_cards = new_master_cards
 
-        save_master_cards()
+        save_master_cards(force=bool(added or removed))
         debug(f"Master cards synced: {len(new_master_cards)} active cards")
 
     except Exception as e:
@@ -585,20 +654,28 @@ def verify_master_card_in_db(cursor, facility, user_id, card_id):
             # Successful online verification — refresh the local freshness stamp
             # so the bounded fail-open window restarts from now.
             key = f"{facility},{user_id}"
+            should_save = False
             with master_lock:
                 if key in master_cards:
                     master_cards[key]['last_verified'] = time.time()
-                    save_master_cards()
+                    should_save = True
+            # Do not hold master_lock across save_master_cards (it takes the
+            # same non-reentrant lock). Debounced unless membership changed.
+            if should_save:
+                save_master_cards()
             return True
 
         # Card not found or inactive - remove from local storage (fail SECURE:
         # an explicit revocation seen while online takes effect immediately).
         key = f"{facility},{user_id}"
+        revoked = False
         with master_lock:
             if key in master_cards:
                 report(f"Master card revoked: {key}")
                 del master_cards[key]
-                save_master_cards()
+                revoked = True
+        if revoked:
+            save_master_cards(force=True)
 
         return False
 
@@ -751,13 +828,11 @@ def sync_cache_from_server():
 
         with cache_lock:
             local_cache = new_cache
-        save_cache()
-        report(f"Cache synced from server: {len(new_cache['cards'])} cards")
 
         # Apply gate config + status LED config + master scan settings from door settings
         apply_door_settings(door_info)
 
-        # Load global settings
+        # Load global settings before save_cache so heartbeat_interval is persisted
         try:
             cursor.execute("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('master_scans_hold_open', 'master_scans_release_hold', 'heartbeat_interval')")
             cached_settings = {}
@@ -771,6 +846,9 @@ def sync_cache_from_server():
                 local_cache['settings'] = cached_settings
         except Exception:
             pass
+
+        save_cache()
+        report(f"Cache synced from server: {len(new_cache['cards'])} cards")
 
     except pymysql.Error as e:
         with state_lock:
@@ -2270,18 +2348,11 @@ def count_todays_granted_scans(user_id):
     count = 0
 
     try:
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-                try:
-                    logs = json.load(f)
-                    for entry in logs:
-                        if (entry.get('user_id') == user_id
-                                and entry.get('granted')
-                                and entry.get('timestamp', '').startswith(today_str)):
-                            count += 1
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        for entry in _read_ndjson_entries(log_file):
+            if (entry.get('user_id') == user_id
+                    and entry.get('granted')
+                    and str(entry.get('timestamp', '')).startswith(today_str)):
+                count += 1
     except Exception as e:
         debug(f"Error counting daily scans: {e}")
 
@@ -2820,11 +2891,124 @@ def reject_card(user_id, reason="Access denied"):
 
 
 # ============================================================
-# LOGGING
+# LOGGING (append-only NDJSON — avoid rewriting the whole file per event)
 # ============================================================
 
+def _read_ndjson_entries(path):
+    """Return dict entries from an NDJSON log or a legacy pretty-printed JSON array."""
+    entries = []
+    if not os.path.exists(path):
+        return entries
+    try:
+        with open(path, 'r') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                peek = ''
+                while True:
+                    ch = f.read(1)
+                    if not ch:
+                        break
+                    if ch.isspace():
+                        continue
+                    peek = ch
+                    break
+                f.seek(0)
+                if peek == '[':
+                    try:
+                        data = json.load(f)
+                    except (json.JSONDecodeError, ValueError):
+                        data = []
+                    if isinstance(data, list):
+                        entries = [e for e in data if isinstance(e, dict)]
+                    return entries
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if isinstance(obj, dict):
+                        entries.append(obj)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        debug(f"Error reading log {path}: {e}")
+    return entries
+
+
+def _compact_ndjson(fh, path, max_entries):
+    """Keep the last max_entries lines of an exclusive-locked NDJSON file."""
+    fh.seek(0)
+    lines = [ln for ln in fh if ln.strip()]
+    if len(lines) <= max_entries:
+        _ndjson_line_counts[path] = len(lines)
+        return
+    keep = lines[-max_entries:]
+    fh.seek(0)
+    fh.truncate()
+    fh.writelines(keep)
+    fh.flush()
+    _ndjson_line_counts[path] = len(keep)
+
+
+def _append_ndjson(path, entry, max_entries):
+    """Append one compact JSON object as a line. Compact only when well over cap.
+
+    Migrates a legacy pretty-printed JSON array in place under the same lock.
+    Does not fsync — the server logs table is the system of record when online.
+    """
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    line = json.dumps(entry, separators=(',', ':'), default=str) + '\n'
+    with open(path, 'a+') as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            peek = ''
+            while True:
+                ch = f.read(1)
+                if not ch:
+                    break
+                if ch.isspace():
+                    continue
+                peek = ch
+                break
+            if peek == '[':
+                f.seek(0)
+                try:
+                    data = json.load(f)
+                except (json.JSONDecodeError, ValueError):
+                    debug(f"JSON corruption detected in {path}, resetting")
+                    data = []
+                if not isinstance(data, list):
+                    data = []
+                f.seek(0)
+                f.truncate()
+                count = 0
+                for item in data:
+                    f.write(json.dumps(item, separators=(',', ':'), default=str) + '\n')
+                    count += 1
+                _ndjson_line_counts[path] = count
+            f.seek(0, os.SEEK_END)
+            f.write(line)
+            count = _ndjson_line_counts.get(path)
+            if count is None:
+                f.flush()
+                f.seek(0)
+                count = sum(1 for ln in f if ln.strip())
+            else:
+                count += 1
+            _ndjson_line_counts[path] = count
+            # Hysteresis: rewrite at most every ~10% over the cap, not every event.
+            if count > max_entries + max(50, max_entries // 10):
+                _compact_ndjson(f, path, max_entries)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
 def log_access(user_id, card_id, facility, granted, reason=""):
-    """Log access attempt to local file (for offline backup)"""
+    """Log access attempt to local file (for offline backup / daily scan limits)"""
     log_file = os.path.join(CACHE_DIR, f"{zone}_access_log.json")
 
     entry = {
@@ -2839,32 +3023,7 @@ def log_access(user_id, card_id, facility, granted, reason=""):
     }
 
     try:
-        # Use file locking to prevent race conditions
-        with open(log_file, 'a+') as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content:
-                    try:
-                        logs = json.loads(content)
-                    except (json.JSONDecodeError, ValueError):
-                        debug(f"JSON corruption detected in {log_file}, resetting")
-                        logs = []
-                else:
-                    logs = []
-
-                logs.append(entry)
-
-                # Keep only last 1000 entries
-                if len(logs) > 1000:
-                    logs = logs[-1000:]
-
-                f.seek(0)
-                f.truncate()
-                json.dump(logs, f, indent=2)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        _append_ndjson(log_file, entry, ACCESS_LOG_MAX_ENTRIES)
     except Exception as e:
         debug(f"Error writing access log: {e}")
 
@@ -2881,32 +3040,7 @@ def log_door_event(event_type, details=""):
     }
 
     try:
-        # Use file locking to prevent race conditions
-        with open(log_file, 'a+') as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content:
-                    try:
-                        logs = json.loads(content)
-                    except (json.JSONDecodeError, ValueError):
-                        debug(f"JSON corruption detected in {log_file}, resetting")
-                        logs = []
-                else:
-                    logs = []
-
-                logs.append(entry)
-
-                # Keep only last 500 entries
-                if len(logs) > 500:
-                    logs = logs[-500:]
-
-                f.seek(0)
-                f.truncate()
-                json.dump(logs, f, indent=2)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        _append_ndjson(log_file, entry, DOOR_EVENTS_MAX_ENTRIES)
     except Exception as e:
         debug(f"Error writing door event log: {e}")
 
@@ -3175,6 +3309,7 @@ def start_command_poll_thread():
 def command_poll_loop():
     """Lightweight fast-polling loop that checks for remote commands and sends lock state"""
     global running, hold_open_schedule_active, hold_open_schedule_suppressed
+    global _last_poll_locked, _last_poll_held
 
     if not MYSQL_AVAILABLE:
         return
@@ -3197,8 +3332,13 @@ def command_poll_loop():
                     time.sleep(DB_RETRY_INTERVAL)
                     continue
                 debug("Command poll: connected to database")
+                # Force a lock-state UPDATE after reconnect so the server is not
+                # left with a stale locked/held_open from before the drop.
+                _last_poll_locked = None
+                _last_poll_held = None
 
             cursor = db.cursor(pymysql.cursors.DictCursor)
+            wrote = False
 
             # Check for remote commands and read current poll interval
             cursor.execute(
@@ -3219,6 +3359,7 @@ def command_poll_loop():
                         "UPDATE doors SET unlock_requested = 0 WHERE name = %s",
                         (zone,)
                     )
+                    wrote = True
 
                     log_door_event('remote_unlock', 'Unlocked by remote request')
                     report("Remote unlock requested by server")
@@ -3238,6 +3379,7 @@ def command_poll_loop():
                         "UPDATE doors SET hold_requested = 0, held_open = 1 WHERE name = %s",
                         (zone,)
                     )
+                    wrote = True
                 elif hold_req == 2 and zone_config.get("unlocked", False):
                     zone_config["unlocked"] = False
                     lock_door()
@@ -3250,22 +3392,31 @@ def command_poll_loop():
                         "UPDATE doors SET hold_requested = 0, held_open = 0 WHERE name = %s",
                         (zone,)
                     )
+                    wrote = True
                 elif hold_req:
                     # Stale request (e.g. hold requested but already held), just clear it
                     cursor.execute(
                         "UPDATE doors SET hold_requested = 0 WHERE name = %s",
                         (zone,)
                     )
+                    wrote = True
 
-            # Send real-time lock state and held_open AFTER processing commands
+            # Send real-time lock state only when it changed. Heartbeat already
+            # refreshes last_seen; a no-op UPDATE+COMMIT every 3–15s is the
+            # dominant MariaDB fsync source on an SD-card server.
             with state_lock:
                 locked_status = 0 if door_unlocked else 1
             held_open_val = 1 if zone_config.get("unlocked", False) else 0
-            cursor.execute(
-                "UPDATE doors SET locked = %s, held_open = %s WHERE name = %s",
-                (locked_status, held_open_val, zone)
-            )
-            db.commit()
+            if locked_status != _last_poll_locked or held_open_val != _last_poll_held:
+                cursor.execute(
+                    "UPDATE doors SET locked = %s, held_open = %s WHERE name = %s",
+                    (locked_status, held_open_val, zone)
+                )
+                _last_poll_locked = locked_status
+                _last_poll_held = held_open_val
+                wrote = True
+            if wrote:
+                db.commit()
 
         except pymysql.Error as e:
             debug(f"Command poll error: {e}")

@@ -274,6 +274,10 @@ if [ "$UNINSTALL_SERVER" = true ]; then
     rm -f /etc/logrotate.d/pidoors
     ok "Log rotation configuration removed"
 
+    rm -f /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf
+    rm -f /etc/systemd/journald.conf.d/pidoors.conf
+    systemctl restart systemd-journald 2>/dev/null || true
+
 fi
 
 # ============================================================
@@ -350,6 +354,9 @@ info "Removing log files..."
 rm -f /var/log/pidoors.log*
 find /var/log/nginx -name "*pidoors*" -delete 2>/dev/null || true
 ok "Log files removed"
+
+rm -f /etc/systemd/journald.conf.d/pidoors.conf
+systemctl restart systemd-journald 2>/dev/null || true
 
 # ============================================================
 # Summary

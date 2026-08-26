@@ -1197,6 +1197,40 @@ cat > /etc/logrotate.d/pidoors <<'LOGROTATE'
 LOGROTATE
 ok "Log rotation configured"
 
+# Raspberry Pi SD-card hygiene: cap the persistent journal, and (on a Pi that
+# also runs MariaDB) flush InnoDB redo once per second instead of per COMMIT.
+# x86/VM servers are left at MariaDB defaults. See INSTALLATION_GUIDE.md
+# "Raspberry Pi SD-card endurance".
+if [ -f /proc/device-tree/model ] && grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/pidoors.conf <<'JOURNALD'
+[Journal]
+Storage=persistent
+SystemMaxUse=50M
+SystemMaxFileSize=10M
+RuntimeMaxUse=20M
+MaxRetentionSec=14day
+Compress=yes
+JOURNALD
+    systemctl restart systemd-journald 2>/dev/null || true
+    ok "journald capped at 50M (Raspberry Pi)"
+
+    if [ "$INSTALL_SERVER" = true ]; then
+        mkdir -p /etc/mysql/mariadb.conf.d
+        cat > /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf <<'MARIACNF'
+[mysqld]
+# SD-card endurance: write the redo log to the OS cache on COMMIT, flush ~1s.
+# Power loss can lose about one second of in-flight heartbeats/polls.
+# Remove this file and restart MariaDB to restore innodb_flush_log_at_trx_commit=1.
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+skip-log-bin
+MARIACNF
+        systemctl restart mariadb 2>/dev/null || true
+        ok "MariaDB SD-card flush settings installed (90-pidoors-sd.cnf)"
+    fi
+fi
+
 # Backup script (server only)
 if [ "$INSTALL_SERVER" = true ]; then
     mkdir -p /var/backups/pidoors

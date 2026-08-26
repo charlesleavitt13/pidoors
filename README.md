@@ -115,6 +115,7 @@ PiDoors is a complete, industrial-grade access control system built on Raspberry
 - Auto-reconnection
 - Automated backups
 - Service redundancy
+- SD-card write coalescing on the controller (append-only logs, skip no-op cache/heartbeat SQL) — see [Raspberry Pi SD-card endurance](pidoors/INSTALLATION_GUIDE.md#raspberry-pi-sd-card-endurance)
 
 ### Security
 - **TLS database encryption** — controller-to-server connections encrypted automatically
