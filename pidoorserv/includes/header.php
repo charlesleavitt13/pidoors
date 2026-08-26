@@ -28,7 +28,8 @@ if (is_logged_in() && is_admin()) {
 
         if ($uc_stale) {
             // Auto-check GitHub
-            $uc_ch = curl_init('https://api.github.com/repos/sybethiesant/pidoors/releases/latest');
+            require_once __DIR__ . '/github.php';
+            $uc_ch = curl_init(pidoors_github_release_latest_url(isset($config) ? $config : null));
             curl_setopt_array($uc_ch, [
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT => 5,

@@ -42,6 +42,7 @@ tests/
 pidoors-ui/node_modules/
 pidoors-ui/dist/
 pidoors-ui/.tsbuildinfo
+pidoors-ui/tsconfig.tsbuildinfo
 
 # IDE / tools
 .vscode/

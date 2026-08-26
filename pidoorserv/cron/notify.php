@@ -51,6 +51,40 @@ try {
 } catch (Exception $e) {}
 date_default_timezone_set($site_timezone);
 
+// ── Log retention (always, even if email notifications are off) ──
+// Settings expose log_retention_days; honor it here so the logs table does not
+// grow forever on an SD-card server. LIMIT keeps each 5-minute pass short.
+$retention = 365;
+try {
+    $ret_row = $pdo_access->query("SELECT setting_value FROM settings WHERE setting_key = 'log_retention_days'")->fetch();
+    if ($ret_row && $ret_row['setting_value'] !== '' && $ret_row['setting_value'] !== null) {
+        $retention = (int)$ret_row['setting_value'];
+    }
+} catch (Exception $e) {
+    // settings table may not exist yet on first run
+}
+if ($retention < 30) {
+    $retention = 30;
+} elseif ($retention > 3650) {
+    $retention = 3650;
+}
+try {
+    $pdo_access->exec("DELETE FROM logs WHERE Date < NOW() - INTERVAL {$retention} DAY LIMIT 10000");
+} catch (Exception $e) {
+    error_log("PiDoors notify cron: log retention error: " . $e->getMessage());
+}
+try {
+    $pdo_access->exec("DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL {$retention} DAY LIMIT 5000");
+} catch (Exception $e) {
+    error_log("PiDoors notify cron: audit log retention error: " . $e->getMessage());
+}
+
+try {
+    $pdo_access->exec("DELETE FROM notification_log WHERE sent_at < NOW() - INTERVAL 30 DAY");
+} catch (Exception $e) {
+    // Table might not exist yet on first run
+}
+
 // Load notification settings - bail early if disabled
 $ns = get_notification_settings($pdo_access);
 if (empty($ns['email_notifications']) || $ns['email_notifications'] !== '1') {
@@ -171,11 +205,4 @@ try {
     }
 } catch (Exception $e) {
     error_log("PiDoors notify cron: daily summary error: " . $e->getMessage());
-}
-
-// ── Cleanup old notification log entries (older than 30 days) ──
-try {
-    $pdo_access->exec("DELETE FROM notification_log WHERE sent_at < NOW() - INTERVAL 30 DAY");
-} catch (Exception $e) {
-    // Table might not exist yet on first run
 }

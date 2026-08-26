@@ -160,14 +160,20 @@ function secure_session_start($config) {
             $_SESSION['created'] = time();
         }
 
-        // App-level idle timeout check (0 = unlimited)
+        // App-level idle timeout check (0 = unlimited). Debounce last_activity
+        // writes to at most once per 60s so dashboard GET polls (every 3s) do
+        // not rewrite the session file on every request. PHP session.lazy_write
+        // then skips the disk flush when $_SESSION is unchanged.
+        $now = time();
         if ($idle_timeout > 0 && isset($_SESSION['last_activity']) &&
-            (time() - $_SESSION['last_activity'] > $idle_timeout)) {
+            ($now - $_SESSION['last_activity'] > $idle_timeout)) {
             session_unset();
             session_destroy();
             session_start();
+            $_SESSION['last_activity'] = $now;
+        } elseif (!isset($_SESSION['last_activity']) || ($now - $_SESSION['last_activity'] >= 60)) {
+            $_SESSION['last_activity'] = $now;
         }
-        $_SESSION['last_activity'] = time();
     }
 }
 

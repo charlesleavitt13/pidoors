@@ -26,6 +26,7 @@ Complete step-by-step instructions for setting up the PiDoors Access Control Sys
 9. [Troubleshooting](#troubleshooting)
 10. [Maintenance](#maintenance)
     - [Uninstall](#uninstall)
+    - [Raspberry Pi SD-card endurance](#raspberry-pi-sd-card-endurance)
 11. [Upgrading](#upgrading)
 
 ---
@@ -164,14 +165,14 @@ cd ~
 3. **Download PiDoors** (requires internet connection):
 
 ```bash
-git clone https://github.com/sybethiesant/pidoors.git
+git clone https://github.com/charlesleavitt13/pidoors.git
 ```
 
 If you get an error that git isn't installed:
 
 ```bash
 sudo apt-get install git -y
-git clone https://github.com/sybethiesant/pidoors.git
+git clone https://github.com/charlesleavitt13/pidoors.git
 ```
 
 4. **Go into the PiDoors folder**:
@@ -292,7 +293,7 @@ sudo reboot
 
 ```bash
 cd ~
-git clone https://github.com/sybethiesant/pidoors.git
+git clone https://github.com/charlesleavitt13/pidoors.git
 cd pidoors
 ```
 
@@ -1189,6 +1190,135 @@ Choose **1) Server**, **2) Door Controller**, or **3) Both**. For a server unins
 
 The script stops services, removes web files, nginx/PHP config, the controller under `/opt/pidoors`, TLS certificates, firewall rules, and the `pidoors` user. Type `yes` at the final prompt to proceed.
 
+### Raspberry Pi SD-card endurance
+
+PiDoors on a microSD card is a wear concern, especially if this Pi runs **MariaDB** (the server or a combined server+door). A door-controller-only Pi writes far less. Fresh installs on a Raspberry Pi already:
+
+- Cap journald at 50M (`/etc/systemd/journald.conf.d/pidoors.conf`)
+- Set MariaDB `innodb_flush_log_at_trx_commit=2` (`/etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf`) so commits flush about once per second instead of on every heartbeat/poll
+- Disable nginx access logging for `/api/` (dashboard polls every 3s)
+
+Do the rest on the Pi as root. Backup or clone the card before fstab, MariaDB, or boot-order changes.
+
+#### 0. Measure
+
+```bash
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
+findmnt -no OPTIONS /
+swapon --show
+# SD write counters: field 7 = writes completed, field 10 = 512-byte sectors written
+cat /sys/block/mmcblk0/stat
+sleep 60
+cat /sys/block/mmcblk0/stat
+sudo apt install -y iotop
+sudo iotop -aoP
+```
+
+A combined server will show `mysqld` dominating. A controller-only node will show `pidoors.py` and `systemd-journald`.
+
+#### 1. Best fix if this Pi runs MariaDB: boot from USB SSD or NVMe
+
+Moving the whole OS off the card is simpler than relocating only `/var/lib/mysql`.
+
+1. Plug a USB 3 SSD into a blue USB 3 port, **or** fit an M.2 NVMe HAT (Pi 5) and confirm `lsblk` shows `sda` / `nvme0n1`.
+2. Clone the running system with the desktop **SD Card Copier**, or `rpi-clone`.
+3. Set EEPROM boot order so USB/NVMe is tried before SD:
+
+```bash
+sudo raspi-config
+# Advanced Options → Bootloader → Boot Order → NVMe/USB Boot
+```
+
+Or `sudo rpi-eeprom-config --edit` and set `BOOT_ORDER` per the [Raspberry Pi boot-order docs](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#BOOT_ORDER). After reboot, `findmnt /` should **not** be `mmcblk0p2`.
+
+#### 2. If you stay on microSD
+
+Use a high-endurance / industrial card (not a no-name Class 10). Confirm root is mounted `noatime`:
+
+```bash
+sudo cp -a /etc/fstab /etc/fstab.bak
+sudo nano /etc/fstab
+```
+
+Root line:
+
+```
+PARTUUID=xxxxxxxx-02  /  ext4  defaults,noatime  0  1
+```
+
+```bash
+sudo mount -o remount,noatime /
+findmnt -no OPTIONS /
+```
+
+Optional: `defaults,noatime,commit=60` journals at most once per 60s. A hard power cut can then lose up to ~60s of filesystem data — skip this if the Pi has no UPS.
+
+#### 3. Stop swapping to the SD card (use zram)
+
+```bash
+swapon --show
+```
+
+If you already have `/dev/zram0` and no `/var/swap`, you are done (Raspberry Pi OS Trixie `rpi-swap`). On Bookworm:
+
+```bash
+sudo apt update
+sudo apt install zram-tools
+sudo tee /etc/default/zramswap >/dev/null <<'EOF'
+ALGO=lz4
+PERCENT=25
+PRIORITY=100
+EOF
+sudo dphys-swapfile swapoff
+sudo dphys-swapfile uninstall
+sudo systemctl disable --now dphys-swapfile
+sudo rm -f /var/swap
+sudo systemctl restart zramswap
+swapon --show   # expect /dev/zram0
+```
+
+A Pi 5 with 4GB+ often needs no swap at all — just do not leave `/var/swap` on the card.
+
+#### 4. PHP sessions on tmpfs (server)
+
+Dashboard polling rewrites a session file. Moving sessions to RAM means a reboot logs everyone out (they sign in again).
+
+```bash
+sudo systemctl stop php*-fpm nginx
+sudo mkdir -p /var/lib/php/pidoors-sessions
+sudo chown www-data:www-data /var/lib/php/pidoors-sessions
+sudo chmod 700 /var/lib/php/pidoors-sessions
+echo 'tmpfs /var/lib/php/pidoors-sessions tmpfs defaults,noatime,mode=0700,uid=www-data,gid=www-data,size=16m 0 0' | sudo tee -a /etc/fstab
+sudo mount /var/lib/php/pidoors-sessions
+sudo systemctl start php*-fpm nginx
+```
+
+#### 5. Optional: controller cache on tmpfs
+
+`/opt/pidoors/cache` holds the 24-hour card cache, local JSON logs, and **`master_cards.json`**. Master cards **must** survive power loss (emergency fail-open). Do not tmpfs the whole directory.
+
+Safer pattern: tmpfs for the cache dir, bind-mount the master-card file from disk. After a power cut the card cache is empty until the next DB sync — **non-master cards fail closed** until then. Only do this if the network and server are reliable.
+
+```bash
+sudo systemctl stop pidoors
+sudo mkdir -p /var/lib/pidoors
+sudo chown pidoors:pidoors /var/lib/pidoors
+if [ -f /opt/pidoors/cache/master_cards.json ]; then
+  sudo cp -a /opt/pidoors/cache/master_cards.json /var/lib/pidoors/master_cards.json
+fi
+sudo touch /var/lib/pidoors/master_cards.json
+sudo chown pidoors:pidoors /var/lib/pidoors/master_cards.json
+echo 'tmpfs /opt/pidoors/cache tmpfs defaults,noatime,mode=0700,uid=pidoors,gid=pidoors,size=256m 0 0' | sudo tee -a /etc/fstab
+sudo mount /opt/pidoors/cache
+echo '/var/lib/pidoors/master_cards.json /opt/pidoors/cache/master_cards.json none bind 0 0' | sudo tee -a /etc/fstab
+sudo mount /opt/pidoors/cache/master_cards.json
+sudo systemctl start pidoors
+```
+
+Keep the tmpfs line **above** the bind line in `/etc/fstab`.
+
+To undo MariaDB SD settings: `sudo rm /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf && sudo systemctl restart mariadb`.
+
 ### Daily Backups (Automatic)
 
 Backups run automatically (if configured) to `/var/backups/pidoors/`
@@ -1410,7 +1540,7 @@ sudo /opt/pidoors/venv/bin/pip install rpi-lgpio -q
 
 | Version | Date | Migration Required | Notes |
 |---------|------|-------------------|-------|
-| Unreleased | Aug 2026 | **Yes** - `database_migration.sql` (adds `hold_open_schedule_id`, `gate_inbound_state`, `gate_outbound_state`) | Enrollment token in installer, `uninstall.sh`, keypad PIN, double gate mode, scheduled hold-open, soft open cycle, timezone from Settings |
+| v0.4.4 | Aug 2026 | **Yes** - `database_migration.sql` (adds `hold_open_schedule_id`, `gate_inbound_state`, `gate_outbound_state`) | Fork releases from charlesleavitt13/pidoors (`GITHUB_REPO`), keypad PIN, double gate mode, scheduled hold-open, soft open cycle, SD-card endurance, `uninstall.sh` |
 | v3.1.5 | Mar 2026 | No | Fix updater deleting ca.pem, auto-restore CA cert on update |
 | v3.1.4 | Mar 2026 | No | Fix false offline status when push fails, better install diagnostics |
 | v3.1.3 | Mar 2026 | No | Fix CA key permissions for cert signing, UI improvements |

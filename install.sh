@@ -28,8 +28,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "$SCRIPT_DIR/VERSION" ]; then
     VERSION=$(cat "$SCRIPT_DIR/VERSION" | tr -d '[:space:]')
 else
-    VERSION="0.3.2"
+    VERSION="0.4.4"
 fi
+
+# Fork/origin used by clone error messages. Updaters read the same file.
+if [ -f "$SCRIPT_DIR/GITHUB_REPO" ]; then
+    GITHUB_REPO=$(tr -d '[:space:]' < "$SCRIPT_DIR/GITHUB_REPO")
+fi
+GITHUB_REPO="${GITHUB_REPO:-charlesleavitt13/pidoors}"
 
 ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
 fail() { echo -e "  ${RED}✗${NC} $1"; }
@@ -475,7 +481,7 @@ EOF
     if [ ! -f "$MIGRATION_SQL" ]; then
         fail "database_migration.sql not found in $SCRIPT_DIR"
         fail "This file is required to create the access control tables."
-        fail "Re-clone the repository: git clone https://github.com/sybethiesant/pidoors.git"
+        fail "Re-clone the repository: git clone https://github.com/${GITHUB_REPO}.git"
         exit 1
     fi
 
@@ -502,6 +508,10 @@ EOF
     cp -r "$SCRIPT_DIR/pidoorserv/"* "$WEB_ROOT/"
     # Copy VERSION file to web root for footer/update page
     [ -f "$SCRIPT_DIR/VERSION" ] && cp "$SCRIPT_DIR/VERSION" "$WEB_ROOT/"
+    [ -f "$SCRIPT_DIR/GITHUB_REPO" ] && cp "$SCRIPT_DIR/GITHUB_REPO" "$WEB_ROOT/"
+    [ -f "$SCRIPT_DIR/database_migration.sql" ] && cp "$SCRIPT_DIR/database_migration.sql" "$WEB_ROOT/"
+    mkdir -p "$WEB_ROOT/nginx"
+    [ -f "$SCRIPT_DIR/nginx/pidoors.conf" ] && cp "$SCRIPT_DIR/nginx/pidoors.conf" "$WEB_ROOT/nginx/"
     # Copy CA cert to web root for door controllers to download
     if [ -f "/etc/mysql/ssl/ca.pem" ]; then
         cp /etc/mysql/ssl/ca.pem "$WEB_ROOT/ca.pem"
@@ -613,9 +623,49 @@ UPGRADESH
 
     cat > /etc/sudoers.d/pidoors-nginx <<SUDOEOF
 www-data ALL=(ALL) NOPASSWD: /usr/local/sbin/pidoors-nginx-upgrade
+www-data ALL=(ALL) NOPASSWD: /usr/local/sbin/pidoors-host-hygiene
 SUDOEOF
     chmod 440 /etc/sudoers.d/pidoors-nginx
     ok "Nginx upgrade helper configured"
+
+    # Host SD-card hygiene helper (journald cap + MariaDB flush). The web UI
+    # updater runs as www-data and calls this via sudoers, same as nginx.
+    cat > /usr/local/sbin/pidoors-host-hygiene <<'HYGIENESH'
+#!/bin/bash
+# Idempotent Raspberry Pi SD-card settings. No-op on non-Pi hosts.
+set -e
+if [ ! -f /proc/device-tree/model ] || ! grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
+    exit 0
+fi
+mkdir -p /etc/systemd/journald.conf.d
+if [ ! -f /etc/systemd/journald.conf.d/pidoors.conf ]; then
+    cat > /etc/systemd/journald.conf.d/pidoors.conf <<'JOURNALD'
+[Journal]
+Storage=persistent
+SystemMaxUse=50M
+SystemMaxFileSize=10M
+RuntimeMaxUse=20M
+MaxRetentionSec=14day
+Compress=yes
+JOURNALD
+    systemctl restart systemd-journald 2>/dev/null || true
+fi
+if command -v mysql >/dev/null 2>&1 || [ -d /etc/mysql/mariadb.conf.d ]; then
+    mkdir -p /etc/mysql/mariadb.conf.d
+    if [ ! -f /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf ]; then
+        cat > /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf <<'MARIACNF'
+[mysqld]
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+skip-log-bin
+MARIACNF
+        systemctl restart mariadb 2>/dev/null || true
+    fi
+fi
+HYGIENESH
+    chmod 755 /usr/local/sbin/pidoors-host-hygiene
+    /usr/local/sbin/pidoors-host-hygiene || true
+    ok "Host hygiene helper configured"
 
     # ── Admin user ──
 
@@ -792,11 +842,28 @@ if [ "$INSTALL_DOOR" = true ]; then
             echo
             prompt D0_PIN "DATA0 GPIO pin" "24"
             prompt D1_PIN "DATA1 GPIO pin" "23"
+            echo
+            echo "  Wiegand keypads (for example HID T-AC04) can accept a 4-digit PIN."
+            echo "  0-9 enters digits, * is ignored, # submits. PIN access is online-only"
+            echo "  and matches the card's Card ID / PIN field."
+            echo
+            prompt KEYPAD_ENABLE "Enable keypad PIN access? (y/n)" "n"
+            case "$(echo "$KEYPAD_ENABLE" | tr '[:upper:]' '[:lower:]')" in
+                y|yes) KEYPAD_ENABLED="true" ;;
+                *)     KEYPAD_ENABLED="false" ;;
+            esac
             READER_JSON="\"reader_type\": \"wiegand\",
         \"d0\": $D0_PIN,
         \"d1\": $D1_PIN,
-        \"wiegand_format\": \"auto\","
-            ok "Reader: Wiegand on GPIO $D0_PIN/$D1_PIN"
+        \"wiegand_format\": \"auto\",
+        \"keypad_enabled\": $KEYPAD_ENABLED,
+        \"keypad_pin_timeout_seconds\": 15,
+        \"keypad_diagnostic_capture\": false,"
+            if [ "$KEYPAD_ENABLED" = "true" ]; then
+                ok "Reader: Wiegand on GPIO $D0_PIN/$D1_PIN (keypad PIN enabled)"
+            else
+                ok "Reader: Wiegand on GPIO $D0_PIN/$D1_PIN (keypad PIN disabled)"
+            fi
             ;;
     esac
 
@@ -817,6 +884,9 @@ if [ "$INSTALL_DOOR" = true ]; then
     echo -e "  ${BOLD}Server:${NC}          $DB_HOST"
     echo -e "  ${BOLD}Database:${NC}        $DB_NAME (user: $DB_USER)"
     echo -e "  ${BOLD}Reader type:${NC}     $READER_TYPE"
+    if [ "$READER_TYPE" = "wiegand" ]; then
+        echo -e "  ${BOLD}Keypad PIN:${NC}      $KEYPAD_ENABLED"
+    fi
     echo -e "  ${BOLD}Lock GPIO:${NC}       $LATCH_PIN"
     echo -e "  ${BOLD}Unlock time:${NC}     ${UNLOCK_SEC}s"
     echo
@@ -877,6 +947,8 @@ if [ "$INSTALL_DOOR" = true ]; then
 
     # Copy VERSION file and update script
     [ -f "$SCRIPT_DIR/VERSION" ] && cp "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/"
+    [ -f "$SCRIPT_DIR/GITHUB_REPO" ] && cp "$SCRIPT_DIR/GITHUB_REPO" "$INSTALL_DIR/"
+    [ -f "$DOOR_SRC/requirements.txt" ] && cp "$DOOR_SRC/requirements.txt" "$INSTALL_DIR/"
     if [ -f "$DOOR_SRC/pidoors-update.sh" ]; then
         cp "$DOOR_SRC/pidoors-update.sh" "$INSTALL_DIR/"
         chmod +x "$INSTALL_DIR/pidoors-update.sh"
@@ -1196,6 +1268,40 @@ cat > /etc/logrotate.d/pidoors <<'LOGROTATE'
 }
 LOGROTATE
 ok "Log rotation configured"
+
+# Raspberry Pi SD-card hygiene: cap the persistent journal, and (on a Pi that
+# also runs MariaDB) flush InnoDB redo once per second instead of per COMMIT.
+# x86/VM servers are left at MariaDB defaults. See INSTALLATION_GUIDE.md
+# "Raspberry Pi SD-card endurance".
+if [ -f /proc/device-tree/model ] && grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/pidoors.conf <<'JOURNALD'
+[Journal]
+Storage=persistent
+SystemMaxUse=50M
+SystemMaxFileSize=10M
+RuntimeMaxUse=20M
+MaxRetentionSec=14day
+Compress=yes
+JOURNALD
+    systemctl restart systemd-journald 2>/dev/null || true
+    ok "journald capped at 50M (Raspberry Pi)"
+
+    if [ "$INSTALL_SERVER" = true ]; then
+        mkdir -p /etc/mysql/mariadb.conf.d
+        cat > /etc/mysql/mariadb.conf.d/90-pidoors-sd.cnf <<'MARIACNF'
+[mysqld]
+# SD-card endurance: write the redo log to the OS cache on COMMIT, flush ~1s.
+# Power loss can lose about one second of in-flight heartbeats/polls.
+# Remove this file and restart MariaDB to restore innodb_flush_log_at_trx_commit=1.
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+skip-log-bin
+MARIACNF
+        systemctl restart mariadb 2>/dev/null || true
+        ok "MariaDB SD-card flush settings installed (90-pidoors-sd.cnf)"
+    fi
+fi
 
 # Backup script (server only)
 if [ "$INSTALL_SERVER" = true ]; then

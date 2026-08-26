@@ -122,6 +122,8 @@ function pidoors_deploy_update(array $config, PDO $pdo_access, PDO $pdo, string 
         $sub = substr($item->getPathname(), strlen($apppath) + 1);
         if ($sub === 'includes' . DIRECTORY_SEPARATOR . 'config.php' || $sub === 'includes/config.php') continue;
         if ($sub === 'VERSION' || $sub === 'database_migration.sql' || $sub === 'ca.pem') continue;
+        if ($sub === 'GITHUB_REPO') continue;
+        if (str_starts_with($sub, 'nginx' . DIRECTORY_SEPARATOR) || $sub === 'nginx') continue;
         if (str_starts_with($sub, 'pidoors-ui-dist') || str_starts_with($sub, 'pidoors-ui-dist' . DIRECTORY_SEPARATOR)) continue;
         if (str_starts_with(basename($sub), '.')) continue;
 
@@ -149,6 +151,10 @@ function pidoors_deploy_update(array $config, PDO $pdo_access, PDO $pdo, string 
         if (!copy($extracted . '/VERSION', $apppath . '/VERSION')) {
             return ['ok' => false, 'msg' => "Files copied but VERSION file update failed.", 'details' => $details];
         }
+    }
+
+    if (file_exists($extracted . '/GITHUB_REPO')) {
+        @copy($extracted . '/GITHUB_REPO', $apppath . '/GITHUB_REPO');
     }
 
     // --- Copy database migration ---
@@ -200,6 +206,14 @@ function pidoors_deploy_update(array $config, PDO $pdo_access, PDO $pdo, string 
             } else {
                 $details[] = 'Nginx config changed but helper not installed — run the installer to add it';
             }
+        }
+    }
+
+    $hygiene = '/usr/local/sbin/pidoors-host-hygiene';
+    if (is_executable($hygiene)) {
+        @exec('sudo -n ' . escapeshellarg($hygiene) . ' 2>&1', $hyg_out, $hyg_rc);
+        if ($hyg_rc === 0) {
+            $details[] = 'Host SD-card settings applied';
         }
     }
 

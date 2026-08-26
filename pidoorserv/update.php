@@ -116,7 +116,8 @@ if (isset($_POST['check_updates']) && verify_csrf_token($_POST['csrf_token'] ?? 
 }
 
 if ($do_check) {
-    $ch = curl_init('https://api.github.com/repos/sybethiesant/pidoors/releases/latest');
+    require_once __DIR__ . '/includes/github.php';
+    $ch = curl_init(pidoors_github_release_latest_url($config));
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT => 10,

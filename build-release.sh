@@ -88,8 +88,10 @@ info "Packaging release..."
 
 # Core files
 cp VERSION "$STAGING/"
+cp GITHUB_REPO "$STAGING/"
 cp database_migration.sql "$STAGING/"
 cp install.sh "$STAGING/"
+cp uninstall.sh "$STAGING/"
 cp server-update.sh "$STAGING/"
 cp build-release.sh "$STAGING/"
 cp README.md "$STAGING/"
@@ -166,28 +168,39 @@ if [ "$PUBLISH" = true ]; then
         exit 1
     fi
 
-    # Tag if not already tagged
-    if git rev-parse "$TAG" > /dev/null 2>&1; then
-        warn "Tag $TAG already exists"
-    else
-        git tag "$TAG"
-        ok "Created tag $TAG"
+    if git rev-parse "$TAG" >/dev/null 2>&1; then
+        fail "Tag $TAG already exists. Bump VERSION before publishing."
+        exit 1
     fi
 
-    git push origin main --tags
-    ok "Pushed to origin"
+    BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    git tag "$TAG"
+    ok "Created tag $TAG"
+    git push origin "$BRANCH" --tags
+    ok "Pushed $BRANCH and tags to origin"
 
-    # Create GitHub release with the tarball AND its checksum as assets.
-    # Publishing the .sha256 is what lets updaters verify integrity before
-    # extracting/deploying.
-    gh release create "$TAG" "$TARBALL" "$SHA256_FILE" --title "$TAG" --notes "Release $VERSION" --latest
-    ok "GitHub release created with assets: $TARBALL, $SHA256_FILE"
+    GH_REPO=$(tr -d '[:space:]' < "$SCRIPT_DIR/GITHUB_REPO" 2>/dev/null || echo "charlesleavitt13/pidoors")
+    NOTES_FILE="$OUTDIR/release-notes.md"
+    cat > "$NOTES_FILE" <<NOTES
+Release $VERSION
+
+Install from this fork: \`git clone https://github.com/${GH_REPO}.git\`
+
+See INSTALLATION_GUIDE.md version history for changes since 0.4.3.
+NOTES
+
+    gh release create "$TAG" "$TARBALL" "$SHA256_FILE" \
+        --repo "$GH_REPO" \
+        --title "$TAG" \
+        --notes-file "$NOTES_FILE" \
+        --latest
+    ok "GitHub release created on $GH_REPO with assets: $TARBALL, $SHA256_FILE"
 else
     echo
     info "Tarball ready: $TARBALL"
     info "Checksum ready: $SHA256_FILE"
     info "To publish: ./build-release.sh --publish"
-    info "Or manually: gh release create $TAG $TARBALL $SHA256_FILE --title \"$TAG\" --notes \"Release $VERSION\""
+    info "Or manually: gh release create $TAG $TARBALL $SHA256_FILE --repo charlesleavitt13/pidoors --title \"$TAG\" --notes \"Release $VERSION\""
 fi
 
 echo

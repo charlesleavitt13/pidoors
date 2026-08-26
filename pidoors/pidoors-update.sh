@@ -11,7 +11,12 @@ set -euo pipefail
 
 ZONE="${1:-}"
 INSTALL_DIR="/opt/pidoors"
-REPO="sybethiesant/pidoors"
+# Prefer the GITHUB_REPO file from this install, then the extracted release.
+if [ -f "$INSTALL_DIR/GITHUB_REPO" ]; then
+    REPO=$(tr -d '[:space:]' < "$INSTALL_DIR/GITHUB_REPO")
+else
+    REPO="charlesleavitt13/pidoors"
+fi
 TMPDIR="${2:-}"  # May be passed by self-update re-exec
 DETACHED="${3:-}"  # Set to "detached" when re-launched outside cgroup
 
@@ -407,6 +412,9 @@ fi
 
 # All copies succeeded — now update VERSION
 copy_file "$EXTRACTED/VERSION" "$INSTALL_DIR/VERSION"
+if [ -f "$EXTRACTED/GITHUB_REPO" ]; then
+    copy_file "$EXTRACTED/GITHUB_REPO" "$INSTALL_DIR/GITHUB_REPO"
+fi
 
 # Fix ownership
 chown -R pidoors:pidoors "$INSTALL_DIR"

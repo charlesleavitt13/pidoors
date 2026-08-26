@@ -10,6 +10,7 @@
 // Bootstrap
 $config = include(__DIR__ . '/includes/config.php');
 require_once __DIR__ . '/includes/security.php';
+require_once __DIR__ . '/includes/github.php';
 require_once $config['apppath'] . 'database/db_connection.php';
 require_once __DIR__ . '/includes/push.php';
 secure_session_start($config);
@@ -2432,7 +2433,7 @@ if ($resource === 'update') {
         }
 
         if ($cache_stale) {
-            $ch = curl_init('https://api.github.com/repos/sybethiesant/pidoors/releases/latest');
+            $ch = curl_init(pidoors_github_release_latest_url($config));
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT => 5,
@@ -2463,7 +2464,7 @@ if ($resource === 'update') {
 
         // Determine target version
         $target = '';
-        $ch = curl_init('https://api.github.com/repos/sybethiesant/pidoors/releases/latest');
+        $ch = curl_init(pidoors_github_release_latest_url($config));
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 10,
