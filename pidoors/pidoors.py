@@ -126,6 +126,7 @@ gate_held = False              # True = ignore movement commands until released
 gate_config = {}               # Loaded from DB doors.gate_config
 gate_active_output = None      # Currently active output ('open'/'close'/'stop'/None)
 gate_stop_event = None         # threading.Event used to interrupt active output
+gate_io_generation = 0         # Bumped when GPIO is rebuilt; stale output threads must not touch pins
 gate_input_pins = {}           # Map of pin number -> input name ('open'/'stop'/'close'/'clearance')
 gate_output_pins = {}          # Map of output name -> pin number
 gate_tap_state = {}            # Per-input tap counter state: {name: {'count':n, 'expires':t}}
@@ -1008,11 +1009,10 @@ def status_led_flash(times=3, interval=0.1):
 def teardown_gate_io():
     """Remove edge detection from any previously-registered gate input pins.
 
-    setup_gate_io runs on every cache sync. GPIO.add_event_detect raises
-    RuntimeError ("conflicting edge detection") if a callback is already
-    registered on a pin, so we must remove the OLD registrations before
-    re-adding (mirrors reconfigure_door_sensor). Output pins don't use edge
-    detection, so they don't need removal."""
+    GPIO.add_event_detect raises RuntimeError ("conflicting edge detection")
+    if a callback is already registered on a pin, so we must remove the OLD
+    registrations before re-adding (mirrors reconfigure_door_sensor). Output
+    pins don't use edge detection; callers deassert them before rebuilding."""
     global gate_input_pins, gate_clearance_pin
     for pin in list(gate_input_pins.keys()):
         try:
@@ -1028,25 +1028,56 @@ def teardown_gate_io():
     gate_clearance_pin = None
 
 
-def setup_gate_io(cfg):
-    """Set up gate input/output GPIO pins from config."""
-    global gate_enabled, gate_config, gate_input_pins, gate_output_pins, gate_stop_event
-    global gate_clearance_pin, gate_clearance_clear
+def _deassert_gate_outputs():
+    """Drive every currently mapped gate output inactive."""
+    for name in list(gate_output_pins.keys()):
+        try:
+            _gate_set_output(name, False)
+        except Exception:
+            pass
 
-    # Remove edge detection registered by a previous setup_gate_io call before
-    # we re-register below, otherwise the 2nd+ cache sync raises RuntimeError.
+
+def setup_gate_io(cfg):
+    """Set up gate input/output GPIO pins from config.
+
+    Returns True if GPIO was (re)configured, False if cfg matches the live
+    config and existing pin state was left alone. Hourly cache sync must not
+    drop hold-open relays or replace the live stop event.
+    """
+    global gate_enabled, gate_config, gate_input_pins, gate_output_pins, gate_stop_event
+    global gate_clearance_pin, gate_clearance_clear, gate_io_generation, gate_active_output
+
+    cfg = cfg or {}
+
+    if gate_enabled and cfg == gate_config:
+        return False
+
+    # Wake any hold/output thread blocked on the current event before we
+    # replace it. Bump generation first so that thread will not deassert
+    # pins after we rebuild the map (or after hold is resumed).
+    old_stop = gate_stop_event
+    gate_io_generation += 1
+    if old_stop is not None:
+        old_stop.set()
+    _deassert_gate_outputs()
+    if old_stop is not None:
+        deadline = time.time() + 0.5
+        while gate_active_output is not None and time.time() < deadline:
+            time.sleep(0.05)
+
     teardown_gate_io()
 
-    gate_config = cfg or {}
+    gate_config = cfg
     gate_input_pins = {}
     gate_output_pins = {}
     gate_stop_event = threading.Event()
     gate_clearance_pin = None
     gate_clearance_clear = True
+    gate_active_output = None
 
     if not gate_config:
         gate_enabled = False
-        return
+        return True
 
     gate_enabled = True
 
@@ -1141,6 +1172,8 @@ def setup_gate_io(cfg):
             GPIO.add_event_detect(pin, GPIO.BOTH, callback=gate_clearance_event,
                                  bouncetime=int(clearance.get('debounce_ms', 50)))
             debug(f"Gate clearance sensor on GPIO {pin} (clear={gate_clearance_clear})")
+
+    return True
 
 
 def gate_clearance_event(channel):
@@ -1350,6 +1383,7 @@ def _gate_run_output(name, transient_state):
     """Run a gate output for its configured duration. Cuts early if stop_event is set."""
     global gate_active_output, gate_inbound_state, gate_outbound_state
     duration = _gate_output_duration(name)
+    gen = gate_io_generation
     if not _gate_set_output(name, True):
         return
     with gate_lock:
@@ -1370,6 +1404,11 @@ def _gate_run_output(name, transient_state):
     interrupted = stop_event.wait(timeout=duration)
     if interrupted:
         debug(f"Gate output '{name}' interrupted by stop")
+    if gen != gate_io_generation:
+        with gate_lock:
+            if gate_active_output == name:
+                gate_active_output = None
+        return
     _gate_set_output(name, False)
     lane = name.split('.', 1)[0] if '.' in name else None
     action = name.split('.', 1)[1] if '.' in name else name
@@ -1406,9 +1445,14 @@ def _gate_run_output(name, transient_state):
 def _run_soft_open_cycle(lane, cycle_seconds, stop_event):
     """Report opening/closing timing for a gate-opener-driven cycle; no GPIO is touched here."""
     global gate_active_output, gate_inbound_state, gate_outbound_state
+    gen = gate_io_generation
     half = cycle_seconds / 2.0
 
     interrupted = stop_event.wait(timeout=half)
+    if gen != gate_io_generation:
+        with gate_lock:
+            gate_active_output = None
+        return
     if not interrupted:
         gate_set_state('closing')
         if lane == 'inbound':
@@ -1416,6 +1460,10 @@ def _run_soft_open_cycle(lane, cycle_seconds, stop_event):
         elif lane == 'outbound':
             gate_outbound_state = 'closing'
         interrupted = stop_event.wait(timeout=half)
+        if gen != gate_io_generation:
+            with gate_lock:
+                gate_active_output = None
+            return
 
     with gate_lock:
         gate_active_output = None
@@ -1463,6 +1511,7 @@ def _run_soft_close_after_hold(lane_cycles, stop_event):
     lane_cycles: list of (lane or None, cycle_seconds).
     """
     global gate_active_output
+    gen = gate_io_generation
 
     for lane, _seconds in lane_cycles:
         _set_lane_gate_state(lane, 'closing')
@@ -1476,6 +1525,11 @@ def _run_soft_close_after_hold(lane_cycles, stop_event):
         wait = half - elapsed
         if not interrupted and wait > 0:
             interrupted = bool(stop_event.wait(timeout=wait))
+            if gen != gate_io_generation:
+                with gate_lock:
+                    if gate_active_output in ('double', 'soft-close'):
+                        gate_active_output = None
+                return
             if not interrupted:
                 elapsed = half
         final = 'stopped' if interrupted else 'closed'
@@ -1508,11 +1562,12 @@ def _should_soft_close_after_hold(double_gate):
     return _open_output_soft_cycle_seconds('open') is not None
 
 
-def _gate_run_double_hold_open():
+def _gate_run_double_hold_open(restore=False):
     """Open both double-gate lanes and hold both open until released."""
     global gate_active_output, gate_inbound_state, gate_outbound_state, gate_stop_event
 
     targets = ('inbound.open', 'outbound.open')
+    gen = gate_io_generation
     if not all(_gate_set_output(target, True) for target in targets):
         for target in targets:
             _gate_set_output(target, False)
@@ -1520,16 +1575,27 @@ def _gate_run_double_hold_open():
 
     with gate_lock:
         gate_active_output = 'double'
-        gate_inbound_state = 'opening'
-        gate_outbound_state = 'opening'
-    gate_set_state('opening')
+        if not restore:
+            gate_inbound_state = 'opening'
+            gate_outbound_state = 'opening'
+    if not restore:
+        gate_set_state('opening')
     gate_inbound_state = 'open'
     gate_outbound_state = 'open'
     gate_set_state('open', held=True)
 
     # Keep both relays active until the shared release command. This is
     # intentionally different from a normal timed open command.
-    gate_stop_event.wait()
+    stop_event = gate_stop_event
+    if stop_event is None:
+        stop_event = threading.Event()
+        gate_stop_event = stop_event
+    stop_event.wait()
+    if gen != gate_io_generation:
+        with gate_lock:
+            if gate_active_output == 'double':
+                gate_active_output = None
+        return True
     for target in targets:
         _gate_set_output(target, False)
 
@@ -1718,6 +1784,33 @@ def gate_grant_access(name):
     return ok
 
 
+def _resume_gate_hold():
+    """Re-assert hold GPIO after a real GPIO (re)setup if the gate is still held.
+
+    Must not go through gate_command('hold'): that command is ignored when
+    gate_held is already true, and refused while gate_active_output is set.
+    """
+    global gate_stop_event
+
+    if not gate_held or not gate_config.get('double_gate'):
+        return
+
+    targets = ('inbound.open', 'outbound.open')
+    if not all(target in gate_output_pins for target in targets):
+        report("Double gate hold restore skipped: both open outputs are required")
+        return
+
+    if gate_active_output == 'double' and gate_stop_event is not None and not gate_stop_event.is_set():
+        for target in targets:
+            _gate_set_output(target, True)
+        report("Double gate hold restored (GPIO re-asserted)")
+        return
+
+    gate_stop_event = threading.Event()
+    threading.Thread(target=_gate_run_double_hold_open, kwargs={'restore': True}, daemon=True).start()
+    report("Double gate hold restored (GPIO re-asserted)")
+
+
 def apply_door_settings(door_info):
     """Apply gate config, LED config, and persisted hold state from DB door row."""
     global gate_state, gate_held, gate_enabled, gate_inbound_state, gate_outbound_state
@@ -1734,14 +1827,22 @@ def apply_door_settings(door_info):
                 cfg = json.loads(cfg_str) if isinstance(cfg_str, str) else cfg_str
             except Exception as e:
                 report(f"Failed to parse gate_config: {e}")
-        setup_gate_io(cfg)
-        # Restore persisted state
-        with gate_lock:
-            gate_state = door_info.get('gate_state') or 'idle'
-            gate_inbound_state = door_info.get('gate_inbound_state') or gate_state
-            gate_outbound_state = door_info.get('gate_outbound_state') or gate_state
-            gate_held = bool(door_info.get('gate_held'))
-        debug(f"Gate restored: state={gate_state} held={gate_held}")
+        io_reset = setup_gate_io(cfg)
+        # Restore persisted state only when GPIO was actually (re)configured.
+        # Hourly cache sync must not overwrite live motion/hold with a stale
+        # DB snapshot, and must not drop hold relays.
+        if io_reset:
+            try:
+                held = bool(int(door_info.get('gate_held') or 0))
+            except (TypeError, ValueError):
+                held = bool(door_info.get('gate_held'))
+            with gate_lock:
+                gate_state = door_info.get('gate_state') or 'idle'
+                gate_inbound_state = door_info.get('gate_inbound_state') or gate_state
+                gate_outbound_state = door_info.get('gate_outbound_state') or gate_state
+                gate_held = held
+            debug(f"Gate restored: state={gate_state} held={gate_held}")
+            _resume_gate_hold()
     else:
         # Gate mode turned OFF — tear down any gate IO and clear gate_enabled so
         # scans/commands route back to standard door behavior. Without this,
@@ -1749,7 +1850,7 @@ def apply_door_settings(door_info):
         # behaving as a gate.
         if gate_enabled:
             report("Gate mode disabled — tearing down gate IO")
-            teardown_gate_io()
+            setup_gate_io({})
         gate_enabled = False
         with gate_lock:
             gate_state = 'idle'
