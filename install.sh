@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "$SCRIPT_DIR/VERSION" ]; then
     VERSION=$(cat "$SCRIPT_DIR/VERSION" | tr -d '[:space:]')
 else
-    VERSION="0.5.0"
+    VERSION="0.4.4"
 fi
 
 # Fork/origin used by clone error messages. Updaters read the same file.

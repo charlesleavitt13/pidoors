@@ -1540,7 +1540,7 @@ sudo /opt/pidoors/venv/bin/pip install rpi-lgpio -q
 
 | Version | Date | Migration Required | Notes |
 |---------|------|-------------------|-------|
-| v0.5.0 | Aug 2026 | **Yes** - `database_migration.sql` (adds `hold_open_schedule_id`, `gate_inbound_state`, `gate_outbound_state`) | Fork releases from charlesleavitt13/pidoors (`GITHUB_REPO`), keypad PIN, double gate mode, scheduled hold-open, soft open cycle, SD-card endurance, `uninstall.sh` |
+| v0.4.4 | Aug 2026 | **Yes** - `database_migration.sql` (adds `hold_open_schedule_id`, `gate_inbound_state`, `gate_outbound_state`) | Fork releases from charlesleavitt13/pidoors (`GITHUB_REPO`), keypad PIN, double gate mode, scheduled hold-open, soft open cycle, SD-card endurance, `uninstall.sh` |
 | v3.1.5 | Mar 2026 | No | Fix updater deleting ca.pem, auto-restore CA cert on update |
 | v3.1.4 | Mar 2026 | No | Fix false offline status when push fails, better install diagnostics |
 | v3.1.3 | Mar 2026 | No | Fix CA key permissions for cert signing, UI improvements |

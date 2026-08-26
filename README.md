@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/license-Open%20Source-blue)
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi-red)
-![Version](https://img.shields.io/badge/version-0.5.0-green)
+![Version](https://img.shields.io/badge/version-0.4.4-green)
 ![Status](https://img.shields.io/badge/status-Production%20Ready-brightgreen)
 
 **Professional-grade physical access control powered by Raspberry Pi**
@@ -757,7 +757,7 @@ Contributions welcome! Please:
 
 ## Roadmap
 
-**Current Version: 0.5.0** - Pre-release (fork: charlesleavitt13/pidoors)
+**Current Version: 0.4.4** - Pre-release (fork: charlesleavitt13/pidoors)
 
 **Future Enhancements** (community contributions welcome):
 - Mobile app (iOS/Android)
@@ -772,7 +772,7 @@ Contributions welcome! Please:
 
 > **Note:** Version numbering was reset from 3.x to 0.x in April 2026. The project had rapidly iterated from v1.0 to v3.2 during initial development. The 0.x series reflects pre-release status as the system matures toward a proper v1.0.0 release.
 
-### Version 0.5.0 (August 2026)
+### Version 0.4.4 (August 2026)
 **Installer, keypad PIN, double gates, scheduled hold-open, soft open cycle, and SD-card endurance.**
 
 Releases and in-app updates now track `GITHUB_REPO` (`charlesleavitt13/pidoors`) instead of the upstream `sybethiesant/pidoors` repository.
