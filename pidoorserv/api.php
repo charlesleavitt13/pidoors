@@ -2200,6 +2200,9 @@ if ($resource === 'backups') {
         if (!is_dir($backup_dir)) {
             if (!@mkdir($backup_dir, 0750, true)) json_error('Cannot create backup directory');
         }
+        if (!is_writable($backup_dir)) {
+            json_error('Backup directory is not writable by the web server: ' . $backup_dir);
+        }
 
         $filename = 'pidoors_backup_' . date('Y-m-d_His') . '.sql';
         $filepath = $backup_dir . $filename;
@@ -2210,22 +2213,11 @@ if ($resource === 'backups') {
         $db_name1 = $config['sqldb'];
         $db_name2 = $config['sqldb2'];
 
-        // Try mysqldump first, fall back to PHP PDO backup
-        $mysqldump_path = trim(shell_exec('which mysqldump 2>/dev/null') ?: '');
-        if (!empty($mysqldump_path)) {
-            putenv('MYSQL_PWD=' . $db_pass);
-            $cmd = "mysqldump -h " . escapeshellarg($db_host) . " -u " . escapeshellarg($db_user) . " --databases " . escapeshellarg($db_name1) . " " . escapeshellarg($db_name2) . " > " . escapeshellarg($filepath) . " 2>&1";
-            exec($cmd, $output, $return_code);
-            putenv('MYSQL_PWD');
-            if ($return_code !== 0) {
-                @unlink($filepath);
-                json_error('Backup failed: ' . implode("\n", $output));
-            }
-        } else {
-            // PHP PDO fallback (matches backup.php approach)
+        $write_pdo_backup = function () use ($pdo, $pdo_access, $db_name1, $db_name2, $filepath) {
             $sql_content = "-- PiDoors Backup\n-- Date: " . date('Y-m-d H:i:s') . "\n\n";
-            foreach ([$pdo => $db_name1, $pdo_access => $db_name2] as $db_pdo => $db_name) {
-                $sql_content .= "-- Database: $db_name\n\n";
+            foreach ([[$pdo, $db_name1], [$pdo_access, $db_name2]] as $pair) {
+                [$db_pdo, $db_name] = $pair;
+                $sql_content .= "-- Database: $db_name\nCREATE DATABASE IF NOT EXISTS `$db_name`;\nUSE `$db_name`;\n\n";
                 $tables = $db_pdo->query("SHOW TABLES")->fetchAll(PDO::FETCH_COLUMN);
                 foreach ($tables as $table) {
                     $create = $db_pdo->query("SHOW CREATE TABLE `$table`")->fetch(PDO::FETCH_ASSOC);
@@ -2233,7 +2225,7 @@ if ($resource === 'backups') {
                     $sql_content .= $create['Create Table'] . ";\n\n";
                     $rows = $db_pdo->query("SELECT * FROM `$table`")->fetchAll(PDO::FETCH_ASSOC);
                     foreach ($rows as $row) {
-                        $vals = array_map(function($v) use ($db_pdo) {
+                        $vals = array_map(function ($v) use ($db_pdo) {
                             return $v === null ? 'NULL' : $db_pdo->quote($v);
                         }, array_values($row));
                         $sql_content .= "INSERT INTO `$table` VALUES (" . implode(', ', $vals) . ");\n";
@@ -2241,8 +2233,50 @@ if ($resource === 'backups') {
                     $sql_content .= "\n";
                 }
             }
-            if (file_put_contents($filepath, $sql_content) === false) {
-                json_error('Failed to write backup file');
+            return file_put_contents($filepath, $sql_content) !== false;
+        };
+
+        // Prefer mysqldump. The pidoors DB user has no LOCK TABLES privilege, so
+        // the dump MUST use --single-transaction --skip-lock-tables (same as
+        // /usr/local/bin/pidoors-backup.sh). Do not merge stderr into the SQL
+        // file — that swallowed the real error and produced "Backup failed:".
+        $dumped = false;
+        $dump_error = '';
+        $mysqldump_path = trim(shell_exec('which mysqldump 2>/dev/null') ?: '');
+        if ($mysqldump_path !== '') {
+            $stderr_file = tempnam(sys_get_temp_dir(), 'pidoors-dump-');
+            $ssl_opts = '';
+            if (!empty($config['sql_ssl_ca']) && file_exists($config['sql_ssl_ca'])) {
+                $ssl_opts = ' --ssl-ca=' . escapeshellarg($config['sql_ssl_ca']);
+            }
+            putenv('MYSQL_PWD=' . $db_pass);
+            $cmd = $mysqldump_path
+                . ' --single-transaction --skip-lock-tables'
+                . $ssl_opts
+                . ' -h ' . escapeshellarg($db_host)
+                . ' -u ' . escapeshellarg($db_user)
+                . ' --databases ' . escapeshellarg($db_name1) . ' ' . escapeshellarg($db_name2)
+                . ' > ' . escapeshellarg($filepath)
+                . ' 2>' . escapeshellarg($stderr_file);
+            exec($cmd, $ignored, $return_code);
+            putenv('MYSQL_PWD');
+            $dump_error = is_readable($stderr_file) ? trim((string)file_get_contents($stderr_file)) : '';
+            @unlink($stderr_file);
+            if ($return_code === 0 && file_exists($filepath) && filesize($filepath) > 0) {
+                $dumped = true;
+            } else {
+                @unlink($filepath);
+            }
+        }
+
+        if (!$dumped) {
+            try {
+                if (!$write_pdo_backup()) {
+                    json_error('Failed to write backup file to ' . $backup_dir . ' — check directory permissions.');
+                }
+            } catch (Exception $e) {
+                $hint = $dump_error !== '' ? $dump_error : $e->getMessage();
+                json_error('Backup failed: ' . $hint);
             }
         }
 

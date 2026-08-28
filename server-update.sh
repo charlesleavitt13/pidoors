@@ -230,17 +230,31 @@ tar xzf "$TARBALL" -C "$TMPDIR" || {
     exit 1
 }
 
-# Find extracted directory
-EXTRACTED=$(find "$TMPDIR" -maxdepth 1 -type d -name "pidoors*" | head -1)
+# Locate the extracted release root.
+# TMPDIR is named pidoors-server-update-*, so
+#   find "$TMPDIR" -maxdepth 1 -name 'pidoors*'
+# matches TMPDIR itself (find always prints the start path at depth 0).
+# head -1 then treats the empty temp dir as the release, and pidoorserv/
+# appears "missing". Skip the start path and pick a directory that actually
+# contains the release files. maxdepth 2 also covers an extra wrapper dir.
+EXTRACTED=""
+while IFS= read -r d; do
+    if [ -d "$d/pidoorserv" ] && [ -f "$d/VERSION" ]; then
+        EXTRACTED="$d"
+        break
+    fi
+done < <(find "$TMPDIR" -mindepth 1 -maxdepth 2 -type d)
 if [ -z "$EXTRACTED" ]; then
-    fail "Could not find extracted directory"
+    fail "Could not find extracted release directory (expected pidoorserv/ and VERSION)"
+    fail "Extracted layout:"
+    find "$TMPDIR" -mindepth 1 -maxdepth 3 \( -type d -o -name VERSION \) | sed 's/^/    /' || true
     exit 1
 fi
+ok "Extracted to $EXTRACTED"
 
 # ──────────────────────────────────────────────
 # Pre-flight: verify archive contents
 # ──────────────────────────────────────────────
-
 if [ ! -d "$EXTRACTED/pidoorserv" ]; then
     fail "Release archive missing pidoorserv/ directory"
     exit 1
