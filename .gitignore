@@ -21,6 +21,7 @@ __pycache__/
 
 # Release tarballs
 *.tar.gz
+release/
 
 # OS files
 .DS_Store
